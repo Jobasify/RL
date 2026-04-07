@@ -235,7 +235,7 @@ class ActionTranslator:
         # Move mouse slowly to target (looks natural, triggers tooltip)
         self.ctrl.move(tx, ty)
         print(f"  [HOVER] Hovering at ({tx}, {ty}), waiting for tooltip...")
-        time.sleep(0.5)  # Wait for Factorio tooltip to appear
+        time.sleep(1.2)  # Factorio needs time to render tooltips
 
         # Capture screenshot with tooltip visible
         import mss as mss_mod
@@ -243,12 +243,12 @@ class ActionTranslator:
             img = hover_sct.grab(self.monitor)
         frame = np.array(img)[:, :, :3]
 
-        # Crop region around cursor for focused tooltip read (±200px)
+        # Crop around cursor, biased rightward (Factorio renders tooltips to the right)
         h, w = frame.shape[:2]
-        x1 = max(0, tx - 200)
-        y1 = max(0, ty - 200)
-        x2 = min(w, tx + 200)
-        y2 = min(h, ty + 200)
+        x1 = max(0, tx - 150)
+        y1 = max(0, ty - 300)
+        x2 = min(w, tx + 450)
+        y2 = min(h, ty + 300)
         crop = frame[y1:y2, x1:x2]
 
         # Encode cropped region as base64 JPEG
@@ -309,10 +309,14 @@ class ActionTranslator:
 
             return tooltip_info, True
 
+        except json.JSONDecodeError:
+            _log(f"TOOLTIP MISS: Claude returned non-JSON response")
+            print(f"  [HOVER] TOOLTIP MISS — no structured data, proceeding with demo")
+            return None, True
         except Exception as e:
-            _log(f"Tooltip read failed: {e}")
-            print(f"  [HOVER] Tooltip read failed, proceeding anyway")
-            return None, True  # Proceed on failure
+            _log(f"TOOLTIP MISS: {e}")
+            print(f"  [HOVER] TOOLTIP MISS — {e}, proceeding with demo")
+            return None, True
 
     # ------------------------------------------------------------------
     # Step 2.7: Craft intent — Claude-guided UI navigation
