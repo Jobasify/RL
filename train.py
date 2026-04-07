@@ -717,8 +717,10 @@ def main():
                 # Capture after each repeated action
                 img2 = sct.grab(monitor)
                 skip_frame = np.array(img2)[:, :, :3]
-                r, _ = reward_signal.compute(skip_frame)
+                r, r_details = reward_signal.compute(skip_frame)
                 total_reward += r
+                if r_details.get("inventory_gain"):
+                    print(f"  [REWARD] MINING SUCCESS — inventory gained! (+2.0)")
             action_counts[action_id] += 1
 
             # 3.4 Audio reward

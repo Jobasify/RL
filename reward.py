@@ -64,12 +64,60 @@ class RegionMonitor:
         return self.change_score
 
 
+class InventoryDiffTracker:
+    """Detects inventory gains by comparing hotbar pixel snapshots.
+
+    Watches a narrow strip of the hotbar where item counts render.
+    When pixel content changes in a way consistent with numbers increasing
+    (new bright pixels appearing), awards a mining bonus.
+    """
+
+    MINING_BONUS = 2.0
+
+    def __init__(self, window_w, window_h):
+        # Hotbar item count area — the bottom strip where stack sizes show
+        self.x = int(window_w * 0.27)
+        self.y = int(window_h * 0.94)
+        self.w = int(window_w * 0.46)
+        self.h = int(window_h * 0.04)
+        self.prev_snapshot = None
+        self.gained = False
+
+    def check(self, frame_bgr):
+        """Compare hotbar snapshot. Returns bonus reward if items gained."""
+        roi = frame_bgr[self.y:self.y + self.h, self.x:self.x + self.w]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_snapshot is None:
+            self.prev_snapshot = gray.copy()
+            self.gained = False
+            return 0.0
+
+        # Pixel difference
+        diff = cv2.absdiff(gray, self.prev_snapshot)
+        change = diff.mean()
+
+        # Count bright pixels that appeared (new item count digits are white/bright)
+        new_bright = ((gray > 180) & (self.prev_snapshot < 150)).sum()
+
+        self.prev_snapshot = gray.copy()
+
+        # Significant hotbar change with new bright pixels = item gained
+        if change > 2.0 and new_bright > 10:
+            self.gained = True
+            return self.MINING_BONUS
+        else:
+            self.gained = False
+            return 0.0
+
+
 class RewardSignal:
     """Computes a composite reward from visual changes across screen regions."""
 
     def __init__(self, window_w, window_h):
         self.window_w = window_w
         self.window_h = window_h
+        self.inventory_tracker = InventoryDiffTracker(window_w, window_h)
 
         # Define monitoring regions scaled to window size
         # These target Factorio's default UI layout
@@ -131,6 +179,12 @@ class RewardSignal:
         all_stagnant = all(r.stagnant_frames > 30 for r in self.regions)
         if all_stagnant:
             reward -= 0.01  # Gentle nudge to do something
+
+        # Inventory gain detection — loudest signal in the system
+        mining_bonus = self.inventory_tracker.check(frame_bgr)
+        if mining_bonus > 0:
+            reward += mining_bonus
+            details["inventory_gain"] = True
 
         self.total_reward += reward
         return reward, details

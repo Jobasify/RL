@@ -481,8 +481,14 @@ class ActionTranslator:
         primary_action_id = ACTION_MAP.get(primary, 8)
         move_action_id = DIRECTION_MOVE.get(direction)
 
-        print(f"  [TRANSLATOR] Intent: {intent_name}, target: {target}, "
-              f"direction: {direction}, duration: {duration}s")
+        # Mining uses right-click hold in Factorio (not left-click)
+        if intent_name == "mine":
+            primary_action_id = 9  # Right click
+            print(f"  [TRANSLATOR] Intent: {intent_name} (right-click hold), "
+                  f"target: {target}, direction: {direction}, duration: {duration}s")
+        else:
+            print(f"  [TRANSLATOR] Intent: {intent_name}, target: {target}, "
+                  f"direction: {direction}, duration: {duration}s")
         _log(f"DEMO START: {intent}")
 
         # Route craft intents to specialized handler
@@ -512,6 +518,14 @@ class ActionTranslator:
         total_reward = 0.0
         demo_start = time.time()
 
+        # For mining: hold right-click on target for the full duration
+        mining_hold = (intent_name == "mine" and target_pos)
+        if mining_hold:
+            from pynput.mouse import Button
+            from control import mouse
+            print(f"  [DEMO] Holding right-click on target for {duration}s...")
+            mouse.press(Button.right)
+
         while time.time() - demo_start < duration:
             # Capture observation before action
             img = sct.grab(self.monitor)
@@ -520,23 +534,28 @@ class ActionTranslator:
             obs = self.obs_proc.get()
 
             # Decide action for this step
-            if target_pos and primary_action_id in (8, 9):
-                # Click on target
+            if mining_hold:
+                # Mouse is already held — just keep it pressed, no extra action
+                action_id = 17  # No-op (hold is already active)
+            elif target_pos and primary_action_id in (8, 9):
                 action_id = primary_action_id
             elif move_action_id is not None and (not target_pos or steps % 3 == 0):
-                # Move in the hinted direction periodically
                 action_id = move_action_id
             else:
                 action_id = primary_action_id
 
-            # Execute with frame skip
+            # Execute with frame skip (for mining hold, just capture frames)
             step_reward = 0.0
             for _ in range(FRAME_SKIP):
-                execute_action(self.ctrl, action_id)
+                if not mining_hold:
+                    execute_action(self.ctrl, action_id)
                 img2 = sct.grab(self.monitor)
                 skip_frame = np.array(img2)[:, :, :3]
-                r, _ = self.reward_signal.compute(skip_frame)
+                r, details = self.reward_signal.compute(skip_frame)
                 step_reward += r
+                if details.get("inventory_gain"):
+                    print(f"  [DEMO] MINING SUCCESS — inventory gained!")
+                time.sleep(0.05)  # Pace for mining hold
 
             # Apply demo reward multiplier
             boosted_reward = step_reward * DEMO_REWARD_MULTIPLIER
@@ -578,6 +597,13 @@ class ActionTranslator:
                 if new_pos:
                     target_pos = new_pos
                     self.ctrl.move(target_pos[0], target_pos[1])
+
+        # Release right-click if mining hold was active
+        if mining_hold:
+            from pynput.mouse import Button
+            from control import mouse
+            mouse.release(Button.right)
+            print(f"  [DEMO] Released right-click hold")
 
         _log(f"DEMO END: {steps} steps, reward={total_reward:.3f}")
         print(f"  [DEMO] Complete: {steps} steps, total reward: {total_reward:+.3f}")
