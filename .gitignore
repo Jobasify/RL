@@ -2,6 +2,7 @@
 captures/
 *.wav
 *.png
+*.npz
 
 # Python
 __pycache__/
