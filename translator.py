@@ -4,6 +4,7 @@ Parses advice into structured intents, locates targets visually,
 executes demonstrations, and records them as high-value experiences.
 """
 
+import base64
 import json
 import time
 from datetime import datetime
@@ -188,6 +189,104 @@ class ActionTranslator:
         return best_pos
 
     # ------------------------------------------------------------------
+    # Step 2.5: Hover and read tooltip
+    # ------------------------------------------------------------------
+
+    def hover_and_read(self, target_pos, sct):
+        """Hover over target, wait for tooltip, ask Claude to read it.
+
+        Returns:
+            tooltip_info: dict with entity_type, quantity, etc. or None on failure
+            should_proceed: True if the tooltip confirms a valid target
+        """
+        if not self._init_client():
+            return None, True  # Can't read, proceed anyway
+
+        tx, ty = target_pos
+
+        # Move mouse slowly to target (looks natural, triggers tooltip)
+        self.ctrl.move(tx, ty)
+        print(f"  [HOVER] Hovering at ({tx}, {ty}), waiting for tooltip...")
+        time.sleep(0.5)  # Wait for Factorio tooltip to appear
+
+        # Capture screenshot with tooltip visible
+        import mss as mss_mod
+        with mss_mod.mss() as hover_sct:
+            img = hover_sct.grab(self.monitor)
+        frame = np.array(img)[:, :, :3]
+
+        # Crop region around cursor for focused tooltip read (±200px)
+        h, w = frame.shape[:2]
+        x1 = max(0, tx - 200)
+        y1 = max(0, ty - 200)
+        x2 = min(w, tx + 200)
+        y2 = min(h, ty + 200)
+        crop = frame[y1:y2, x1:x2]
+
+        # Encode cropped region as base64 JPEG
+        _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        image_b64 = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+
+        try:
+            response = self._client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=200,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Read any tooltip or text visible in this Factorio screenshot. "
+                                "What exactly is the player hovering over? What does the tooltip "
+                                "say about quantity, type, or available actions? "
+                                'Return JSON only, no markdown: '
+                                '{"entity_type": "...", "quantity": "...", '
+                                '"available_action": "...", "description": "..."}'
+                            ),
+                        },
+                    ],
+                }],
+            )
+            text = response.content[0].text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            tooltip_info = json.loads(text)
+
+            entity = tooltip_info.get("entity_type", "unknown")
+            qty = tooltip_info.get("quantity", "unknown")
+            desc = tooltip_info.get("description", "")
+
+            print(f"  [HOVER] Read: {entity} (qty: {qty})")
+            if desc:
+                print(f"  [HOVER] Detail: {desc}")
+            _log(f"TOOLTIP at ({tx},{ty}): {json.dumps(tooltip_info)}")
+
+            # Decide if we should proceed
+            entity_lower = entity.lower()
+            # Skip if it's clearly not what we expected (e.g. hovering over water, UI elements)
+            skip_keywords = ["water", "void", "nothing", "no tooltip", "ui", "button", "menu"]
+            if any(kw in entity_lower for kw in skip_keywords):
+                print(f"  [HOVER] Unexpected target: '{entity}' — skipping demo")
+                _log(f"SKIP: unexpected entity '{entity}'")
+                return tooltip_info, False
+
+            return tooltip_info, True
+
+        except Exception as e:
+            _log(f"Tooltip read failed: {e}")
+            print(f"  [HOVER] Tooltip read failed, proceeding anyway")
+            return None, True  # Proceed on failure
+
+    # ------------------------------------------------------------------
     # Step 3 & 4: Execute demonstration and record experiences
     # ------------------------------------------------------------------
 
@@ -219,9 +318,13 @@ class ActionTranslator:
             tx, ty = target_pos
             print(f"  [DEMO] Target '{target}' found at ({tx}, {ty})")
             _log(f"Target located: ({tx}, {ty})")
-            # Move mouse to target
-            self.ctrl.move(tx, ty)
-            time.sleep(0.1)
+
+            # Hover and read tooltip before committing
+            tooltip_info, should_proceed = self.hover_and_read(target_pos, sct)
+            if not should_proceed:
+                print(f"  [DEMO] Aborted — tooltip didn't match expected target")
+                return 0, 0.0
+
         elif direction != "none" and move_action_id is not None:
             print(f"  [DEMO] No target found, moving {direction}")
 
