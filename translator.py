@@ -94,7 +94,7 @@ class ActionTranslator:
     """Translates natural language advice into executed game actions."""
 
     def __init__(self, ctrl, obs_proc, reward_signal, replay, rollout,
-                 monitor, strategy_vec, sct):
+                 monitor, strategy_vec, sct, audio_proc=None, audio_capture=None):
         self.ctrl = ctrl
         self.obs_proc = obs_proc
         self.reward_signal = reward_signal
@@ -103,6 +103,8 @@ class ActionTranslator:
         self.monitor = monitor
         self.strategy_vec = strategy_vec
         self.sct = sct
+        self.audio_proc = audio_proc
+        self.audio_capture = audio_capture
         self._client = None
 
     def _init_client(self):
@@ -371,8 +373,19 @@ class ActionTranslator:
                 # Use 0 log_prob and 0 value for demo steps —
                 # PPO won't use these for ratio computation properly,
                 # but the reward signal still shapes the value function
+                # Get audio features for this step (zero fallback for shape consistency)
+                from audio import AUDIO_FEATURE_DIM
+                demo_audio = None
+                if self.audio_proc and self.audio_capture:
+                    try:
+                        demo_audio, _ = self.audio_proc.process(self.audio_capture)
+                    except Exception:
+                        demo_audio = np.zeros(AUDIO_FEATURE_DIM, dtype=np.float32)
+                elif self.audio_proc is not None:
+                    # Audio proc exists but capture unavailable — use zeros
+                    demo_audio = np.zeros(AUDIO_FEATURE_DIM, dtype=np.float32)
                 self.rollout.push(obs, action_id, 0.0, boosted_reward, 0.0, False,
-                                  strategy=self.strategy_vec)
+                                  strategy=self.strategy_vec, audio=demo_audio)
 
             total_reward += step_reward
             steps += 1

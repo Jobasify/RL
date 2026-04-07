@@ -591,6 +591,7 @@ def main():
             ctrl=ctrl, obs_proc=obs_proc, reward_signal=reward_signal,
             replay=replay, rollout=rollout, monitor=monitor,
             strategy_vec=None, sct=sct,
+            audio_proc=audio_proc, audio_capture=audio_capture,
         )
 
     # --- Timing ---
