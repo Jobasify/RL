@@ -26,6 +26,7 @@ from observation import ObservationProcessor
 from reward import RewardSignal
 from memory import ReplayBuffer
 from network import ActorCritic, NUM_ACTIONS, ACTION_NAMES
+from knowledge import KnowledgeBase, EMBEDDING_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -77,35 +78,71 @@ DECISIONS_PER_SEC = 10      # Pace limiter
 CHECKPOINT_INTERVAL = 1000  # Save every N steps
 MOUSE_STEP = 80             # Pixels per mouse move action
 FRAME_SKIP = 4              # Repeat each action for N frames, observe the last
+STUCK_WINDOW = 500          # Check avg100 trend over this many steps
+STUCK_THRESHOLD = 0.01      # If avg100 improves less than this, agent is stuck
 
 CHECKPOINT_DIR = Path("checkpoints")
 
 # ---------------------------------------------------------------------------
-# Reward multipliers — tune these to shape what the agent cares about
-# Multiplied on top of the base weights in reward.py
-# Set to 0.0 to ignore a region entirely, >1.0 to amplify
-# ---------------------------------------------------------------------------
-REWARD_MULTIPLIERS = {
-    "Resources": 1.0,
-    "Minimap":   1.0,
-    "Hotbar":    1.0,
-    "World":     1.0,
-}
-
-
-# ---------------------------------------------------------------------------
-# Reward multiplier application
+# Curriculum stages — reward weights change as the agent progresses
+# Each stage: (name, step_threshold, region_multipliers, noop_penalty, click_bonus)
+#   - region_multipliers: applied on top of base weights in reward.py
+#   - noop_penalty: subtracted from reward when action 17 (no-op) is chosen
+#   - click_bonus: added to reward when action 8 (left click) is chosen
 # ---------------------------------------------------------------------------
 
-def apply_reward_multipliers(reward_signal):
-    """Apply REWARD_MULTIPLIERS config on top of base region weights."""
+STAGE_THRESHOLDS = [5_000, 20_000]  # Boundaries between stages
+
+CURRICULUM = [
+    {   # Stage 1: Exploration (steps 0 - 5,000)
+        "name": "Exploration",
+        "multipliers": {"Resources": 0.5, "Minimap": 2.0, "Hotbar": 1.0, "World": 2.0},
+        "noop_penalty": 0.02,   # Discourage standing still
+        "click_bonus": 0.0,     # No click bonus yet
+    },
+    {   # Stage 2: Gathering (steps 5,000 - 20,000)
+        "name": "Gathering",
+        "multipliers": {"Resources": 1.0, "Minimap": 0.5, "Hotbar": 3.0, "World": 1.0},
+        "noop_penalty": 0.01,
+        "click_bonus": 0.005,   # Mining = sustained clicking
+    },
+    {   # Stage 3: Automation (steps 20,000+)
+        "name": "Automation",
+        "multipliers": {"Resources": 1.0, "Minimap": 0.5, "Hotbar": 1.5, "World": 3.0},
+        "noop_penalty": 0.005,
+        "click_bonus": 0.002,
+    },
+]
+
+
+def get_stage(step):
+    """Return the current curriculum stage index and config."""
+    for i, threshold in enumerate(STAGE_THRESHOLDS):
+        if step < threshold:
+            return i, CURRICULUM[i]
+    return len(CURRICULUM) - 1, CURRICULUM[-1]
+
+
+def check_stuck(reward_history, window=STUCK_WINDOW, threshold=STUCK_THRESHOLD):
+    """Detect if the agent is stuck by checking avg100 trend.
+    Returns True if avg100 has been flat/declining over the window."""
+    if len(reward_history) < window:
+        return False
+    recent = reward_history[-window:]
+    # Compare first half avg to second half avg
+    half = window // 2
+    first_half = sum(recent[:half]) / half
+    second_half = sum(recent[half:]) / half
+    improvement = second_half - first_half
+    return improvement < threshold
+
+
+def apply_stage(reward_signal, stage_config, base_weights):
+    """Apply a curriculum stage's multipliers to the reward signal."""
     for region in reward_signal.regions:
-        mult = REWARD_MULTIPLIERS.get(region.name, 1.0)
-        region.weight *= mult
-    print("Reward multipliers applied:")
-    for r in reward_signal.regions:
-        mult = REWARD_MULTIPLIERS.get(r.name, 1.0)
-        print(f"  {r.name:12s} base_weight * {mult:.1f} = {r.weight:.1f}")
+        base = base_weights[region.name]
+        mult = stage_config["multipliers"].get(region.name, 1.0)
+        region.weight = base * mult
 
 
 # ---------------------------------------------------------------------------
@@ -169,14 +206,16 @@ class RolloutBuffer:
         self.rewards = []
         self.values = []
         self.dones = []
+        self.strategies = []
 
-    def push(self, obs, action, log_prob, reward, value, done):
+    def push(self, obs, action, log_prob, reward, value, done, strategy=None):
         self.observations.append(obs)
         self.actions.append(action)
         self.log_probs.append(log_prob)
         self.rewards.append(reward)
         self.values.append(value)
         self.dones.append(done)
+        self.strategies.append(strategy)
 
     def __len__(self):
         return len(self.rewards)
@@ -207,6 +246,9 @@ class RolloutBuffer:
         observations = np.stack(self.observations)
         actions = np.array(self.actions, dtype=np.int64)
         old_log_probs = np.array(self.log_probs, dtype=np.float32)
+        has_strategy = self.strategies[0] is not None
+        if has_strategy:
+            strategies = np.stack(self.strategies)
 
         indices = np.arange(n)
         np.random.shuffle(indices)
@@ -214,13 +256,16 @@ class RolloutBuffer:
         for start in range(0, n, MINIBATCH_SIZE):
             end = start + MINIBATCH_SIZE
             idx = indices[start:end]
-            yield {
+            batch = {
                 "obs": observations[idx],
                 "actions": actions[idx],
                 "old_log_probs": old_log_probs[idx],
                 "advantages": advantages[idx],
                 "returns": returns[idx],
             }
+            if has_strategy:
+                batch["strategies"] = strategies[idx]
+            yield batch
 
     def clear(self):
         self.__init__()
@@ -303,9 +348,13 @@ def execute_action(ctrl, action_id):
 def ppo_update(net, optimizer, rollout, device):
     """Run PPO update on collected rollout. Returns mean loss, entropy."""
     # Bootstrap value for last state
+    has_strategy = rollout.strategies[0] is not None
     with torch.no_grad():
         last_obs = torch.from_numpy(rollout.observations[-1]).unsqueeze(0).to(device)
-        _, last_value = net(last_obs)
+        last_strat = None
+        if has_strategy:
+            last_strat = torch.from_numpy(rollout.strategies[-1]).unsqueeze(0).to(device)
+        _, last_value = net(last_obs, strategy=last_strat)
         last_value = last_value.item()
 
     advantages, returns = rollout.compute_gae(last_value)
@@ -325,8 +374,11 @@ def ppo_update(net, optimizer, rollout, device):
             old_lp_t = torch.from_numpy(batch["old_log_probs"]).to(device)
             adv_t = torch.from_numpy(batch["advantages"]).to(device)
             ret_t = torch.from_numpy(batch["returns"]).to(device)
+            strat_t = None
+            if "strategies" in batch:
+                strat_t = torch.from_numpy(batch["strategies"]).to(device)
 
-            log_probs, entropy, values = net.evaluate(obs_t, act_t)
+            log_probs, entropy, values = net.evaluate(obs_t, act_t, strategy=strat_t)
 
             # Policy loss (clipped surrogate)
             ratio = torch.exp(log_probs - old_lp_t)
@@ -416,9 +468,16 @@ def main():
     ctrl = FactorioController()
     obs_proc = ObservationProcessor(size=128, stack_size=4)
     reward_signal = RewardSignal(win_w, win_h)
-    apply_reward_multipliers(reward_signal)
 
-    net = ActorCritic().to(device)
+    # Capture base weights before curriculum modifies them
+    base_weights = {r.name: r.weight for r in reward_signal.regions}
+
+    # --- Knowledge system ---
+    print("\nBuilding knowledge base...")
+    knowledge = KnowledgeBase()
+    knowledge.build()
+
+    net = ActorCritic(strategy_dim=EMBEDDING_DIM).to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=LR, eps=1e-5)
 
     replay = ReplayBuffer(capacity=10_000)
@@ -464,6 +523,8 @@ def main():
     last_loss_info = {}
     action_counts = np.zeros(NUM_ACTIONS, dtype=np.int64)
     reward_history = []  # Rolling window of per-update rewards
+    current_stage_idx = -1  # Force initial stage print
+    last_refresh_step = 0   # Track last knowledge refresh
 
     try:
         while not _kill_flag.is_set():
@@ -480,16 +541,30 @@ def main():
                 print("  [RESUMED] Factorio focused")
                 paused = False
 
+            # 0.5 Curriculum stage check + strategy update
+            stage_idx, stage = get_stage(global_step)
+            if stage_idx != current_stage_idx:
+                current_stage_idx = stage_idx
+                apply_stage(reward_signal, stage, base_weights)
+                strategy_vec = knowledge.get_strategy_vector(stage["name"])
+                strategy_t = torch.from_numpy(strategy_vec).unsqueeze(0).to(device)
+                print(f"\n{'='*60}")
+                print(f"  STAGE {stage_idx + 1}: {stage['name'].upper()} (step {global_step:,}+)")
+                print(f"  Weights: {stage['multipliers']}")
+                print(f"  No-op penalty: {stage['noop_penalty']}  Click bonus: {stage['click_bonus']}")
+                print(f"  Strategy vector updated (knowledge-conditioned)")
+                print(f"{'='*60}\n")
+
             # 1. Capture and preprocess
             img = sct.grab(monitor)
             frame = np.array(img)[:, :, :3]
             obs_proc.push(frame)
             obs = obs_proc.get()  # (4, 128, 128)
 
-            # 2. Get action from network
+            # 2. Get action from network (CNN + strategy)
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-                action, log_prob, value = net.get_action(obs_t)
+                action, log_prob, value = net.get_action(obs_t, strategy=strategy_t)
                 action_id = action.item()
                 log_prob_val = log_prob.item()
                 value_val = value.item()
@@ -507,6 +582,12 @@ def main():
                 total_reward += r
             action_counts[action_id] += 1
 
+            # 3.5 Curriculum action shaping
+            if action_id == 17:  # No-op penalty
+                total_reward -= stage["noop_penalty"]
+            if action_id == 8:   # Left click bonus (mining)
+                total_reward += stage["click_bonus"]
+
             # 4. Use last frame from skip sequence as next observation
             obs_proc.push(skip_frame)
             next_obs = obs_proc.get()
@@ -514,7 +595,8 @@ def main():
             done = False  # Factorio doesn't have episodes; continuous
 
             # 5. Store experience (accumulated reward across skipped frames)
-            rollout.push(obs, action_id, log_prob_val, total_reward, value_val, done)
+            rollout.push(obs, action_id, log_prob_val, total_reward, value_val, done,
+                         strategy=strategy_vec)
             replay.push(obs, action_id, total_reward, next_obs, done)
 
             episode_reward += total_reward
@@ -539,7 +621,7 @@ def main():
                 top_actions = np.argsort(action_counts)[::-1][:5]
                 action_dist = "  ".join(f"{ACTION_NAMES[a]}:{action_counts[a]}" for a in top_actions)
 
-                print(f"[Step {global_step:>7d} | Update {update_count:>3d}] "
+                print(f"[Step {global_step:>7d} | Update {update_count:>3d} | {stage['name']}] "
                       f"reward={episode_reward:+.3f}  "
                       f"avg100={rolling_avg:+.3f}  "
                       f"p_loss={loss_info['policy_loss']:.4f}  "
@@ -550,6 +632,20 @@ def main():
 
                 episode_reward = 0.0
                 episode_steps = 0
+
+                # 6.5 Stagnation detection — refresh knowledge if stuck
+                if (check_stuck(reward_history)
+                        and global_step - last_refresh_step > STUCK_WINDOW):
+                    print(f"\n{'!'*60}")
+                    print(f"  STUCK DETECTED at step {global_step:,}")
+                    print(f"  avg100 flat/declining over last {STUCK_WINDOW} updates")
+                    print(f"  Refreshing knowledge base...")
+                    print(f"{'!'*60}")
+                    knowledge.refresh(stage["name"])
+                    strategy_vec = knowledge.get_strategy_vector(stage["name"])
+                    strategy_t = torch.from_numpy(strategy_vec).unsqueeze(0).to(device)
+                    last_refresh_step = global_step
+                    print(f"  Knowledge refreshed. Resuming training.\n")
 
             # 7. Checkpoint
             if global_step % CHECKPOINT_INTERVAL == 0 and global_step > 0:

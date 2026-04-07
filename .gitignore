@@ -1,6 +1,7 @@
 # Capture outputs
 captures/
 checkpoints/
+knowledge_cache/
 *.wav
 *.png
 *.npz

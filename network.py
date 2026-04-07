@@ -25,10 +25,16 @@ NUM_ACTIONS = 18
 
 
 class ActorCritic(nn.Module):
-    """CNN actor-critic for PPO on Factorio screen observations."""
+    """CNN actor-critic for PPO on Factorio screen observations.
 
-    def __init__(self, in_channels=4, num_actions=NUM_ACTIONS):
+    Optionally accepts a strategy vector from the knowledge system.
+    When provided, the strategy vector is concatenated with CNN features
+    before the policy and value heads — pixels + knowledge = decisions.
+    """
+
+    def __init__(self, in_channels=4, num_actions=NUM_ACTIONS, strategy_dim=0):
         super().__init__()
+        self.strategy_dim = strategy_dim
 
         # --- Convolutional feature extractor ---
         # Input: (B, 4, 128, 128)
@@ -40,7 +46,8 @@ class ActorCritic(nn.Module):
         self._flat_size = 64 * 12 * 12  # 9216
 
         # --- Shared fully connected layer ---
-        self.fc = nn.Linear(self._flat_size, 512)
+        # CNN features + optional strategy vector -> 512
+        self.fc = nn.Linear(self._flat_size + strategy_dim, 512)
 
         # --- Policy head (actor) ---
         self.policy = nn.Linear(512, num_actions)
@@ -57,31 +64,34 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(self.value.weight, gain=1.0)
         nn.init.zeros_(self.value.bias)
 
-    def _extract_features(self, x):
+    def _extract_features(self, x, strategy=None):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = x.reshape(x.size(0), -1)
+        # Concatenate strategy vector if provided
+        if strategy is not None:
+            x = torch.cat([x, strategy], dim=-1)
         x = F.relu(self.fc(x))
         return x
 
-    def forward(self, x):
+    def forward(self, x, strategy=None):
         """Full forward pass. Returns action logits and value estimate."""
-        features = self._extract_features(x)
+        features = self._extract_features(x, strategy)
         logits = self.policy(features)
         value = self.value(features)
         return logits, value
 
-    def get_action(self, x):
+    def get_action(self, x, strategy=None):
         """Sample an action from the policy and return action, log_prob, value."""
-        logits, value = self.forward(x)
+        logits, value = self.forward(x, strategy)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         return action, dist.log_prob(action), value.squeeze(-1)
 
-    def evaluate(self, x, actions):
+    def evaluate(self, x, actions, strategy=None):
         """Evaluate given actions. Returns log_probs, entropy, values (for PPO update)."""
-        logits, value = self.forward(x)
+        logits, value = self.forward(x, strategy)
         dist = torch.distributions.Categorical(logits=logits)
         return dist.log_prob(actions), dist.entropy(), value.squeeze(-1)
 
@@ -101,51 +111,40 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
+    # --- Test without strategy (backward compatible) ---
+    print("--- Mode 1: CNN only (no strategy vector) ---")
     net = ActorCritic().to(device)
-    print(net)
-
     total_params = sum(p.numel() for p in net.parameters())
-    trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print(f"\nTotal parameters:     {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Parameters: {total_params:,}")
 
-    # --- Forward pass test ---
-    print("\n--- Forward pass test ---")
     batch_size = 8
     dummy_obs = torch.randn(batch_size, 4, 128, 128, device=device)
-    print(f"Input shape:  {tuple(dummy_obs.shape)}")
-
     logits, value = net(dummy_obs)
-    print(f"Logits shape: {tuple(logits.shape)}  (batch, {NUM_ACTIONS} actions)")
-    print(f"Value shape:  {tuple(value.shape)}  (batch, 1)")
+    print(f"Input: {tuple(dummy_obs.shape)} -> logits: {tuple(logits.shape)}, value: {tuple(value.shape)}")
 
-    # --- Action sampling test ---
-    print("\n--- Action sampling test ---")
     actions, log_probs, values = net.get_action(dummy_obs)
-    print(f"Sampled actions: {actions.tolist()}")
-    print(f"Action names:    {[ACTION_NAMES[a] for a in actions.tolist()]}")
-    print(f"Log probs shape: {tuple(log_probs.shape)}")
-    print(f"Values shape:    {tuple(values.shape)}")
+    print(f"Actions: {[ACTION_NAMES[a] for a in actions.tolist()[:4]]}...")
 
-    # --- Evaluate test (for PPO) ---
-    print("\n--- Evaluate test (PPO update) ---")
-    log_probs_eval, entropy, values_eval = net.evaluate(dummy_obs, actions)
-    print(f"Log probs:  {tuple(log_probs_eval.shape)}")
-    print(f"Entropy:    {tuple(entropy.shape)}  mean={entropy.mean().item():.3f}")
-    print(f"Values:     {tuple(values_eval.shape)}")
+    # --- Test with strategy vector ---
+    print("\n--- Mode 2: CNN + strategy vector (knowledge-augmented) ---")
+    strategy_dim = 384
+    net2 = ActorCritic(strategy_dim=strategy_dim).to(device)
+    total_params2 = sum(p.numel() for p in net2.parameters())
+    print(f"Parameters: {total_params2:,} (+{total_params2 - total_params:,} from strategy)")
 
-    # --- Policy distribution for single observation ---
-    print("\n--- Single observation policy ---")
-    single = torch.randn(1, 4, 128, 128, device=device)
-    logits, value = net(single)
-    probs = F.softmax(logits, dim=-1).squeeze().detach().cpu().numpy()
-    print(f"Value estimate: {value.item():.4f}")
-    print("Action probabilities:")
-    for i, (name, p) in enumerate(zip(ACTION_NAMES, probs)):
-        bar = "#" * int(p * 50)
-        print(f"  {i:2d} {name:14s} {p:.3f} {bar}")
+    dummy_strategy = torch.randn(batch_size, strategy_dim, device=device)
+    logits2, value2 = net2(dummy_obs, strategy=dummy_strategy)
+    print(f"Input: obs {tuple(dummy_obs.shape)} + strategy {tuple(dummy_strategy.shape)}")
+    print(f"  -> logits: {tuple(logits2.shape)}, value: {tuple(value2.shape)}")
 
-    print("\nAll shapes correct. Network ready for training.")
+    actions2, lp2, v2 = net2.get_action(dummy_obs, strategy=dummy_strategy)
+    print(f"Actions: {[ACTION_NAMES[a] for a in actions2.tolist()[:4]]}...")
+
+    lp_eval, ent, v_eval = net2.evaluate(dummy_obs, actions2, strategy=dummy_strategy)
+    print(f"Evaluate: log_probs {tuple(lp_eval.shape)}, entropy mean={ent.mean().item():.3f}")
+
+    print(f"\nBoth modes work. FC layer: {net._flat_size} (CNN only) vs "
+          f"{net2._flat_size}+{strategy_dim} (CNN+strategy) -> 512")
 
 
 if __name__ == "__main__":
