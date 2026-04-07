@@ -110,12 +110,38 @@ class ActionTranslator:
     def _init_client(self):
         if self._client is None:
             try:
+                import os
                 import anthropic
-                self._client = anthropic.Anthropic()
+                api_key = os.environ.get("ANTHROPIC_API_KEY")
+                if api_key:
+                    self._client = anthropic.Anthropic(api_key=api_key)
+                else:
+                    self._client = anthropic.Anthropic()
             except Exception as e:
                 _log(f"Client init failed: {e}")
                 return False
         return True
+
+    def verify_api(self):
+        """Test API auth on startup. Returns True if working."""
+        if not self._init_client():
+            print("  [TRANSLATOR] API client init FAILED")
+            _log("API verify: client init failed")
+            return False
+        try:
+            # Minimal API call to verify auth
+            response = self._client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=10,
+                messages=[{"role": "user", "content": "Reply OK"}],
+            )
+            print("  [TRANSLATOR] API auth verified OK")
+            _log("API verify: OK")
+            return True
+        except Exception as e:
+            print(f"  [TRANSLATOR] API auth FAILED: {e}")
+            _log(f"API verify: FAILED — {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Step 1: Parse advice into intent
@@ -289,6 +315,150 @@ class ActionTranslator:
             return None, True  # Proceed on failure
 
     # ------------------------------------------------------------------
+    # Step 2.7: Craft intent — Claude-guided UI navigation
+    # ------------------------------------------------------------------
+
+    def _capture_b64(self):
+        """Capture full screen as base64 JPEG for Claude."""
+        import mss as mss_mod
+        with mss_mod.mss() as cap_sct:
+            img = cap_sct.grab(self.monitor)
+        frame = np.array(img)[:, :, :3]
+        h, w = frame.shape[:2]
+        if w > 1280:
+            scale = 1280 / w
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return base64.standard_b64encode(buf.tobytes()).decode("utf-8"), frame
+
+    def _ask_claude_with_image(self, image_b64, prompt):
+        """Send image + prompt to Claude, return text response."""
+        response = self._client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        return response.content[0].text.strip()
+
+    def execute_craft(self, intent, sct):
+        """Handle craft intent with Claude-guided UI navigation.
+        Opens inventory, asks Claude what to click, executes, closes inventory."""
+        if not self._init_client():
+            print("  [CRAFT] No API client, skipping craft demo")
+            return 0, 0.0
+
+        item = intent.get("target", "burner mining drill")
+        if item == "none":
+            item = "burner mining drill"
+
+        print(f"  [CRAFT] Starting craft sequence for: {item}")
+        _log(f"CRAFT START: {item}")
+
+        steps = 0
+        total_reward = 0.0
+
+        # Step 1: Open inventory
+        print(f"  [CRAFT] Opening inventory (E)...")
+        self.ctrl.press_key("e", duration=0.1)
+        time.sleep(0.8)  # Wait for inventory animation
+
+        # Step 2: Capture and ask Claude what to click
+        image_b64, _ = self._capture_b64()
+        try:
+            craft_prompt = (
+                f"The agent wants to craft '{item}' in Factorio. "
+                f"Look at this screenshot. Is the crafting/inventory menu open? "
+                f"Can you see '{item}' or its components in the crafting panel? "
+                f"If yes, describe exactly where to click to craft it — give approximate "
+                f"screen coordinates as percentage from left/top (e.g. 60% from left, 40% from top). "
+                f"If the item isn't visible, say what's needed first. "
+                f'Return JSON only: {{"visible": true/false, "click_x_pct": 0.0-1.0, '
+                f'"click_y_pct": 0.0-1.0, "instructions": "..."}}'
+            )
+            response_text = self._ask_claude_with_image(image_b64, craft_prompt)
+
+            # Parse response
+            if response_text.startswith("```"):
+                response_text = response_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            craft_info = json.loads(response_text)
+
+            visible = craft_info.get("visible", False)
+            instructions = craft_info.get("instructions", "")
+
+            print(f"  [CRAFT] Claude says: {instructions}")
+            _log(f"CRAFT VISION: {json.dumps(craft_info)}")
+
+            if visible:
+                # Step 3: Click where Claude says
+                click_x = int(craft_info.get("click_x_pct", 0.5) * self.ctrl.width)
+                click_y = int(craft_info.get("click_y_pct", 0.5) * self.ctrl.height)
+                print(f"  [CRAFT] Clicking at ({click_x}, {click_y})")
+
+                self.ctrl.click(click_x, click_y, "left")
+                time.sleep(0.3)
+
+                # Click again for quantity (some items need multiple clicks)
+                self.ctrl.click(click_x, click_y, "left")
+                time.sleep(0.3)
+
+                # Capture reward from the crafting action
+                import mss as mss_mod
+                with mss_mod.mss() as cap_sct:
+                    img = cap_sct.grab(self.monitor)
+                frame = np.array(img)[:, :, :3]
+                r, _ = self.reward_signal.compute(frame)
+                total_reward += r
+                steps += 1
+
+                # Step 3.5: Verify — did crafting work?
+                verify_b64, _ = self._capture_b64()
+                verify_text = self._ask_claude_with_image(
+                    verify_b64,
+                    f"Did the crafting succeed? Can you see '{item}' being crafted or "
+                    f"appearing in the inventory? Just say yes or no and what you see."
+                )
+                print(f"  [CRAFT] Verify: {verify_text[:100]}")
+                _log(f"CRAFT VERIFY: {verify_text}")
+            else:
+                print(f"  [CRAFT] Item not visible in crafting menu")
+                _log(f"CRAFT: item not visible")
+
+        except Exception as e:
+            print(f"  [CRAFT] Claude guidance failed: {e}")
+            _log(f"CRAFT ERROR: {e}")
+
+        # Step 4: Close inventory
+        print(f"  [CRAFT] Closing inventory (E)...")
+        self.ctrl.press_key("e", duration=0.1)
+        time.sleep(0.5)
+
+        # Capture final reward
+        import mss as mss_mod
+        with mss_mod.mss() as cap_sct:
+            img = cap_sct.grab(self.monitor)
+        frame = np.array(img)[:, :, :3]
+        r, _ = self.reward_signal.compute(frame)
+        total_reward += r
+        steps += 1
+
+        print(f"  [CRAFT] Complete: {steps} steps, reward: {total_reward:+.3f}")
+        _log(f"CRAFT END: {steps} steps, reward={total_reward:.3f}")
+        return steps, total_reward
+
+    # ------------------------------------------------------------------
     # Step 3 & 4: Execute demonstration and record experiences
     # ------------------------------------------------------------------
 
@@ -310,6 +480,10 @@ class ActionTranslator:
         print(f"  [TRANSLATOR] Intent: {intent_name}, target: {target}, "
               f"direction: {direction}, duration: {duration}s")
         _log(f"DEMO START: {intent}")
+
+        # Route craft intents to specialized handler
+        if intent_name == "craft":
+            return self.execute_craft(intent, sct)
 
         # Capture initial frame to try to locate target
         img = sct.grab(self.monitor)

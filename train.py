@@ -593,6 +593,7 @@ def main():
             strategy_vec=None, sct=sct,
             audio_proc=audio_proc, audio_capture=audio_capture,
         )
+        translator.verify_api()
 
     # --- Timing ---
     step_interval = 1.0 / DECISIONS_PER_SEC
