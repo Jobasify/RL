@@ -80,6 +80,8 @@ MOUSE_STEP = 80             # Pixels per mouse move action
 FRAME_SKIP = 4              # Repeat each action for N frames, observe the last
 STUCK_WINDOW = 500          # Check avg100 trend over this many steps
 STUCK_THRESHOLD = 0.01      # If avg100 improves less than this, agent is stuck
+LOOP_REPEAT_MIN = 5         # Consecutive same-action threshold for loop detection
+LOOP_PENALTY = 0.1          # Penalty for unproductive repetition
 
 CHECKPOINT_DIR = Path("checkpoints")
 
@@ -121,6 +123,47 @@ def get_stage(step):
         if step < threshold:
             return i, CURRICULUM[i]
     return len(CURRICULUM) - 1, CURRICULUM[-1]
+
+
+class RepetitionTracker:
+    """Detects unproductive action loops.
+
+    Tracks consecutive repetitions of the same action and whether
+    reward per repetition is increasing, flat, or declining.
+    Penalises only unproductive loops (flat/declining reward).
+    """
+
+    def __init__(self, repeat_min=LOOP_REPEAT_MIN, penalty=LOOP_PENALTY):
+        self.repeat_min = repeat_min
+        self.penalty = penalty
+        self.last_action = -1
+        self.repeat_count = 0
+        self.repeat_rewards = []  # Reward for each repetition in current streak
+
+    def update(self, action_id, reward):
+        """Track action and return penalty (0.0 or negative)."""
+        if action_id == self.last_action:
+            self.repeat_count += 1
+            self.repeat_rewards.append(reward)
+        else:
+            self.last_action = action_id
+            self.repeat_count = 1
+            self.repeat_rewards = [reward]
+
+        if self.repeat_count < self.repeat_min:
+            return 0.0
+
+        # We have 5+ consecutive same actions — check reward trend
+        recent = self.repeat_rewards[-self.repeat_min:]
+        first_half = sum(recent[:len(recent) // 2])
+        second_half = sum(recent[len(recent) // 2:])
+
+        if second_half >= first_half:
+            # Reward is stable or increasing — productive repetition (mining etc)
+            return 0.0
+        else:
+            # Reward is declining — unproductive loop
+            return -self.penalty
 
 
 def check_stuck(reward_history, window=STUCK_WINDOW, threshold=STUCK_THRESHOLD):
@@ -544,6 +587,7 @@ def main():
     reward_history = []  # Rolling window of per-update rewards
     current_stage_idx = -1  # Force initial stage print
     last_refresh_step = 0   # Track last knowledge refresh
+    rep_tracker = RepetitionTracker()
 
     try:
         while not _kill_flag.is_set():
@@ -608,6 +652,10 @@ def main():
                 total_reward -= stage["noop_penalty"]
             if action_id == 8:   # Left click bonus (mining)
                 total_reward += stage["click_bonus"]
+
+            # 3.6 Unproductive loop detection
+            loop_penalty = rep_tracker.update(action_id, total_reward)
+            total_reward += loop_penalty
 
             # 4. Use last frame from skip sequence as next observation
             obs_proc.push(skip_frame)
