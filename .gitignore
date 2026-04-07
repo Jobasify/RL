@@ -2,6 +2,7 @@
 captures/
 checkpoints/
 knowledge_cache/
+logs/
 *.wav
 *.png
 *.npz

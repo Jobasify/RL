@@ -427,9 +427,9 @@ def save_checkpoint(net, optimizer, step, reward_total, path):
     print(f"  Checkpoint saved: {path} (step {step})")
 
 
-def load_latest_checkpoint(net, optimizer, device):
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
-    checkpoints = sorted(CHECKPOINT_DIR.glob("step_*.pt"))
+def load_latest_checkpoint(net, optimizer, device, checkpoint_dir=CHECKPOINT_DIR):
+    checkpoint_dir.mkdir(exist_ok=True)
+    checkpoints = sorted(checkpoint_dir.glob("step_*.pt"))
     if not checkpoints:
         print("No checkpoint found, starting fresh.")
         return 0, 0.0
@@ -472,20 +472,39 @@ def main():
     # Capture base weights before curriculum modifies them
     base_weights = {r.name: r.weight for r in reward_signal.regions}
 
-    # --- Knowledge system ---
-    print("\nBuilding knowledge base...")
-    knowledge = KnowledgeBase()
-    knowledge.build()
+    # --- Experiment mode ---
+    baseline_mode = "--baseline" in os.sys.argv
+    experiment_tag = "baseline" if baseline_mode else "knowledge"
+    log_file = Path(f"logs/{experiment_tag}.csv")
+    log_file.parent.mkdir(exist_ok=True)
 
-    net = ActorCritic(strategy_dim=EMBEDDING_DIM).to(device)
+    if baseline_mode:
+        print("\n*** BASELINE MODE — pure CNN, no knowledge vector ***")
+        knowledge = None
+        strategy_vec = None
+        strategy_t = None
+        net = ActorCritic(strategy_dim=0).to(device)
+    else:
+        print("\n*** KNOWLEDGE MODE — CNN + strategy vector ***")
+        knowledge = KnowledgeBase()
+        knowledge.build()
+        net = ActorCritic(strategy_dim=EMBEDDING_DIM).to(device)
+
+    total_params = sum(p.numel() for p in net.parameters())
+    print(f"  Parameters: {total_params:,}")
+
     optimizer = torch.optim.Adam(net.parameters(), lr=LR, eps=1e-5)
 
     replay = ReplayBuffer(capacity=10_000)
     rollout = RolloutBuffer()
 
+    # Experiment-specific checkpoints
+    exp_checkpoint_dir = CHECKPOINT_DIR / experiment_tag
+    exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     # Load checkpoint
-    global_step, cumulative_reward = load_latest_checkpoint(net, optimizer, device)
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
+    global_step, cumulative_reward = load_latest_checkpoint(
+        net, optimizer, device, exp_checkpoint_dir)
 
     # Screen capture
     sct = mss.mss()
@@ -546,13 +565,15 @@ def main():
             if stage_idx != current_stage_idx:
                 current_stage_idx = stage_idx
                 apply_stage(reward_signal, stage, base_weights)
-                strategy_vec = knowledge.get_strategy_vector(stage["name"])
-                strategy_t = torch.from_numpy(strategy_vec).unsqueeze(0).to(device)
+                if knowledge is not None:
+                    strategy_vec = knowledge.get_strategy_vector(stage["name"])
+                    strategy_t = torch.from_numpy(strategy_vec).unsqueeze(0).to(device)
                 print(f"\n{'='*60}")
                 print(f"  STAGE {stage_idx + 1}: {stage['name'].upper()} (step {global_step:,}+)")
                 print(f"  Weights: {stage['multipliers']}")
                 print(f"  No-op penalty: {stage['noop_penalty']}  Click bonus: {stage['click_bonus']}")
-                print(f"  Strategy vector updated (knowledge-conditioned)")
+                if knowledge is not None:
+                    print(f"  Strategy vector updated (knowledge-conditioned)")
                 print(f"{'='*60}\n")
 
             # 1. Capture and preprocess
@@ -596,7 +617,7 @@ def main():
 
             # 5. Store experience (accumulated reward across skipped frames)
             rollout.push(obs, action_id, log_prob_val, total_reward, value_val, done,
-                         strategy=strategy_vec)
+                         strategy=strategy_vec if knowledge else None)
             replay.push(obs, action_id, total_reward, next_obs, done)
 
             episode_reward += total_reward
@@ -630,11 +651,21 @@ def main():
                       f"buf={replay_stats['size']:,}")
                 print(f"  Top actions: {action_dist}")
 
+                # CSV log for experiment comparison
+                if update_count == 1:
+                    log_file.write_text("step,update,reward,avg100,p_loss,v_loss,entropy,stage\n")
+                with open(log_file, "a") as f:
+                    f.write(f"{global_step},{update_count},{episode_reward:.4f},"
+                            f"{rolling_avg:.4f},{loss_info['policy_loss']:.4f},"
+                            f"{loss_info['value_loss']:.4f},{loss_info['entropy']:.3f},"
+                            f"{stage['name']}\n")
+
                 episode_reward = 0.0
                 episode_steps = 0
 
                 # 6.5 Stagnation detection — refresh knowledge if stuck
-                if (check_stuck(reward_history)
+                if (knowledge is not None
+                        and check_stuck(reward_history)
                         and global_step - last_refresh_step > STUCK_WINDOW):
                     print(f"\n{'!'*60}")
                     print(f"  STUCK DETECTED at step {global_step:,}")
@@ -651,7 +682,7 @@ def main():
             if global_step % CHECKPOINT_INTERVAL == 0 and global_step > 0:
                 save_checkpoint(
                     net, optimizer, global_step, cumulative_reward + episode_reward,
-                    CHECKPOINT_DIR / f"step_{global_step:07d}.pt",
+                    exp_checkpoint_dir / f"step_{global_step:07d}.pt",
                 )
 
             # 8. Pace control
