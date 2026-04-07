@@ -20,6 +20,7 @@ from pynput.mouse import Button
 from pynput.keyboard import Key
 
 from control import FactorioController, mouse, keyboard
+from craft import CraftingSystem, PlacementSystem, RECIPES, DISPLAY_NAMES
 
 PLAYER_LOG = Path("logs/player.log")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
@@ -69,6 +70,19 @@ SYSTEM_PROMPT = (
     '    "next_milestone": "next thing to achieve"\n'
     '  }\n'
     '}\n\n'
+    "IMPORTANT FACTORIO CONTROLS:\n"
+    "- E opens AND closes inventory and entity UIs. Do NOT use escape to close UIs.\n"
+    "- Escape opens the game menu (pause). Only use escape if you want to pause.\n"
+    "- Right-click on entities opens their UI. E closes it.\n"
+    "- To mine: right_click_hold on a resource tile for 3+ seconds.\n"
+    "- To craft: open inventory (E), click the item in crafting panel, close (E).\n\n"
+    "CRAFTING: To craft items, include a 'craft' field instead of trying to navigate the UI:\n"
+    '  "craft": ["stone_furnace", "iron_gear_wheel"]\n'
+    "Available items: stone_furnace, burner_mining_drill, iron_gear_wheel, "
+    "transport_belt, burner_inserter, wooden_chest, pipe\n"
+    "The crafting system will handle the UI automatically.\n\n"
+    "PLACING: To place a building, include a 'place' field:\n"
+    '  "place": {"item": "stone_furnace", "x": 1300, "y": 700}\n\n'
     "Available input types:\n"
     '- {"type": "key", "key": "w/a/s/d/e/q/space/tab/escape/1-9", "duration": seconds}\n'
     '- {"type": "left_click", "x": pixel_x, "y": pixel_y}\n'
@@ -150,6 +164,40 @@ class GameState:
         if len(self.history) > 10:
             self.history.pop(0)
 
+    def apply_ground_truth(self, real_inventory):
+        """Overwrite estimated inventory with verified values.
+        Recheck milestones against what's actually there."""
+        old_inv = dict(self.inventory)
+        self.inventory = real_inventory
+
+        # Log corrections
+        for item in set(list(old_inv.keys()) + list(real_inventory.keys())):
+            old_val = old_inv.get(item, 0)
+            new_val = real_inventory.get(item, 0)
+            if old_val != new_val:
+                print(f"  [VERIFY] {item}: {old_val} -> {new_val} (corrected)")
+
+        # Recheck milestones — remove any that don't match inventory reality
+        # Keep milestones that are action-based (placed, built) since inventory
+        # won't show those. Only remove item-based hallucinations.
+        verified = []
+        for m in self.milestones_reached:
+            m_lower = m.lower()
+            # Keep action milestones (placed, built, started, opened)
+            if any(kw in m_lower for kw in ["placed", "built", "started", "opened", "researched"]):
+                verified.append(m)
+            # Keep crafting milestones only if the item is/was in inventory
+            elif "crafted" in m_lower:
+                # Check if any inventory item matches
+                if any(k in m_lower for k in real_inventory.keys()):
+                    verified.append(m)
+                else:
+                    print(f"  [VERIFY] Removing unconfirmed milestone: {m}")
+                    _log(f"MILESTONE REMOVED (unconfirmed): {m}")
+            else:
+                verified.append(m)
+        self.milestones_reached = verified
+
     def to_prompt(self):
         """Format state for Claude's prompt."""
         inv_str = ", ".join(f"{k}: {v}" for k, v in self.inventory.items()) or "empty"
@@ -182,6 +230,8 @@ class ClaudePlayer:
         self._budget_exceeded = False
         self._last_reasoning = ""
         self.state = GameState()
+        self.crafter = CraftingSystem(ctrl, monitor)
+        self.placer = PlacementSystem(ctrl, monitor)
 
     def print_cost_estimate(self):
         calls_per_hour = min(3600 / DECISION_INTERVAL, MAX_CALLS_PER_HOUR)
@@ -300,6 +350,78 @@ class ClaudePlayer:
             _log(f"DECIDE ERROR: {type(e).__name__}: {e}")
             return None
 
+    def verify_inventory(self):
+        """Open inventory, screenshot, ask Claude to read it, update ground truth."""
+        if not self.is_available:
+            return
+
+        self._init_client()
+        print(f"\n  [VERIFY] Opening inventory for ground truth check...")
+        _log("VERIFY: opening inventory")
+
+        # Open inventory
+        self.ctrl.press_key("e", duration=0.1)
+        time.sleep(1.0)
+
+        # Capture
+        image_b64 = self._capture_b64()
+
+        try:
+            response = self._client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=500,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
+                        },
+                        {"type": "text", "text": (
+                            "Read the Factorio inventory screen. List every item "
+                            "you can see and its quantity. Include items in the "
+                            "character inventory, crafting queue, and hotbar. "
+                            "Return JSON only, no markdown: "
+                            '{"item_name": quantity, "item_name": quantity}'
+                        )},
+                    ],
+                }],
+            )
+            text = response.content[0].text.strip()
+            self._record_call()
+
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            if not text.startswith("{"):
+                start = text.find("{")
+                end = text.rfind("}")
+                if start != -1 and end > start:
+                    text = text[start:end + 1]
+
+            real_inventory = json.loads(text)
+            # Ensure all values are integers
+            real_inventory = {k: int(v) for k, v in real_inventory.items() if isinstance(v, (int, float))}
+
+            inv_str = ", ".join(f"{k}: {v}" for k, v in real_inventory.items())
+            print(f"  [VERIFY] Real inventory: {inv_str}")
+            _log(f"VERIFY RESULT: {json.dumps(real_inventory)}")
+
+            # Apply ground truth
+            self.state.apply_ground_truth(real_inventory)
+
+        except Exception as e:
+            print(f"  [VERIFY] Failed to read inventory: {e}")
+            _log(f"VERIFY ERROR: {e}")
+
+        # Close inventory
+        self.ctrl.press_key("e", duration=0.1)
+        time.sleep(0.5)
+        print(f"  [VERIFY] Inventory closed, resuming play\n")
+
     def execute(self, decision):
         """Execute Claude's raw input sequence. Returns list of (action_id, duration)."""
         reasoning = decision.get("reasoning", "")
@@ -309,6 +431,35 @@ class ClaudePlayer:
         _log(f"DECISION: {json.dumps(decision)}")
 
         executed = []
+
+        # Handle craft commands — routed through CraftingSystem
+        craft_items = decision.get("craft", [])
+        if craft_items:
+            for item in craft_items:
+                item_key = item.replace(" ", "_").lower()
+                if item_key in RECIPES:
+                    success = self.crafter.craft(item_key)
+                    if success:
+                        # Update state with real crafting result
+                        self.state.inventory[item_key] = self.state.inventory.get(item_key, 0) + 1
+                        # Deduct ingredients
+                        for ingredient, qty in RECIPES[item_key].items():
+                            self.state.inventory[ingredient] = max(0,
+                                self.state.inventory.get(ingredient, 0) - qty)
+                    executed.append((15, 2.0))  # E key approximate
+                else:
+                    print(f"  [CRAFT] Unknown recipe: {item}")
+
+        # Handle place commands — routed through PlacementSystem
+        place_cmd = decision.get("place")
+        if place_cmd:
+            item_key = place_cmd.get("item", "").replace(" ", "_").lower()
+            px = int(place_cmd.get("x", 1280))
+            py = int(place_cmd.get("y", 720))
+            if self.placer.place(item_key, px, py):
+                self.state.inventory[item_key] = max(0,
+                    self.state.inventory.get(item_key, 0) - 1)
+            executed.append((8, 1.0))
 
         for inp in inputs:
             inp_type = inp.get("type", "")
@@ -417,7 +568,11 @@ def main():
     print("\nClaude is playing. Press Ctrl+C to stop.\n")
 
     try:
-        for step in range(10):
+        for step in range(20):
+            # Ground truth check every 5 decisions
+            if step > 0 and step % 5 == 0:
+                player.verify_inventory()
+
             print(f"\n--- Decision {step + 1} ---")
             decision = player.decide()
             if decision:
