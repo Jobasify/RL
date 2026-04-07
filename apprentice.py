@@ -1,12 +1,12 @@
 """
-Apprentice training loop — three-mode training with seamless switching.
+Apprentice training loop — three-mode training with stable-baselines3 PPO.
 
 F9  — Human plays, CNN watches at 10x weight (best training data)
 F10 — Claude plays, CNN watches at 5x weight
-F11 — CNN plays independently at 1x weight
+F11 — CNN plays via SB3 PPO at 1x weight
 F12 — Kill switch (stop training)
 
-All three modes feed the same PPO buffer and training loop.
+All three modes feed the same SB3 PPO model.
 
 Usage:
     python apprentice.py
@@ -16,7 +16,6 @@ import ctypes
 import os
 import time
 import threading
-import random
 from pathlib import Path
 from datetime import datetime
 
@@ -24,39 +23,28 @@ import cv2
 import mss
 import numpy as np
 import torch
-import torch.nn.functional as F
 from pynput import keyboard as kb
 from pynput import mouse as ms
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 
 from capture import find_factorio_window, AudioCapture
 from control import FactorioController
 from observation import ObservationProcessor
 from reward import RewardSignal
-from memory import ReplayBuffer
-from network import ActorCritic, NUM_ACTIONS, ACTION_NAMES
-from knowledge import KnowledgeBase, EMBEDDING_DIM
+from network import NUM_ACTIONS, ACTION_NAMES
 from audio import AudioProcessor, AUDIO_FEATURE_DIM
-from player import (ClaudePlayer, RewardTracker, get_claude_ratio,
-                     EXPERT_REWARD_MULTIPLIER, DECISION_INTERVAL, _log)
+from knowledge import KnowledgeBase, EMBEDDING_DIM
+from factorio_env import FactorioEnv
+from player import (ClaudePlayer, DECISION_INTERVAL,
+                     EXPERT_REWARD_MULTIPLIER)
+from train import execute_action, FRAME_SKIP
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
-STEPS_PER_UPDATE = 512
-PPO_EPOCHS = 4
-MINIBATCH_SIZE = 64
-GAMMA = 0.99
-GAE_LAMBDA = 0.95
-CLIP_EPS = 0.2
-VF_COEF = 0.5
-ENT_COEF = 0.01
-MAX_GRAD_NORM = 0.5
-LR = 3e-4
-DECISIONS_PER_SEC = 10
-CHECKPOINT_INTERVAL = 1000
-FRAME_SKIP = 4
 
 HUMAN_REWARD_MULTIPLIER = 10.0
 CLAUDE_REWARD_MULTIPLIER = EXPERT_REWARD_MULTIPLIER  # 5.0
@@ -64,7 +52,6 @@ CLAUDE_REWARD_MULTIPLIER = EXPERT_REWARD_MULTIPLIER  # 5.0
 CHECKPOINT_DIR = Path("checkpoints/apprentice")
 LOG_FILE = Path("logs/apprentice.csv")
 
-# Modes
 MODE_HUMAN = "HUMAN"
 MODE_CLAUDE = "CLAUDE"
 MODE_CNN = "CNN"
@@ -75,7 +62,7 @@ MODE_CNN = "CNN"
 # ---------------------------------------------------------------------------
 
 _kill_flag = threading.Event()
-_current_mode = MODE_CLAUDE  # Default start mode
+_current_mode = MODE_CLAUDE
 _mode_lock = threading.Lock()
 
 
@@ -91,11 +78,9 @@ def _set_mode(mode):
         _current_mode = mode
     if old != mode:
         print(f"\n  *** MODE SWITCH: {old} -> {mode} ***\n")
-        _log(f"MODE SWITCH: {old} -> {mode}")
 
 
 def _start_hotkeys():
-    """Listen for F9/F10/F11 mode switches and F12 kill."""
     def on_press(key):
         if key == kb.Key.f9:
             _set_mode(MODE_HUMAN)
@@ -109,7 +94,6 @@ def _start_hotkeys():
             return False
     listener = kb.Listener(on_press=on_press, daemon=True)
     listener.start()
-    return listener
 
 
 def _is_factorio_focused():
@@ -128,95 +112,47 @@ def _is_factorio_focused():
 # ---------------------------------------------------------------------------
 
 class HumanRecorder:
-    """Records human mouse and keyboard inputs for training data."""
-
     def __init__(self):
-        self._last_action_id = 17  # no-op
-        self._last_action_time = time.time()
+        self._last_action_id = 17
         self._lock = threading.Lock()
         self._mouse_listener = None
-        self._active = False
 
     def start(self):
-        """Start recording human inputs."""
-        self._active = True
-        # Mouse listener runs in background
-        self._mouse_listener = ms.Listener(
-            on_click=self._on_click,
-            daemon=True,
-        )
+        self._mouse_listener = ms.Listener(on_click=self._on_click, daemon=True)
         self._mouse_listener.start()
 
     def stop(self):
-        self._active = False
         if self._mouse_listener:
             self._mouse_listener.stop()
 
     def _on_click(self, x, y, button, pressed):
-        if not self._active or _get_mode() != MODE_HUMAN:
-            return
-        if pressed:
+        if pressed and _get_mode() == MODE_HUMAN:
             with self._lock:
-                if button == ms.Button.left:
-                    self._last_action_id = 8
-                elif button == ms.Button.right:
-                    self._last_action_id = 9
-                self._last_action_time = time.time()
-
-    def record_key(self, key_char):
-        """Record a key press (called from the main hotkey listener)."""
-        key_map = {"w": 0, "a": 1, "s": 2, "d": 3, "e": 15, "q": 16, " ": 14}
-        with self._lock:
-            self._last_action_id = key_map.get(key_char, 17)
-            self._last_action_time = time.time()
+                self._last_action_id = 8 if button == ms.Button.left else 9
 
     def get_last_action(self):
-        """Get the most recent human action ID."""
         with self._lock:
             return self._last_action_id
 
 
 # ---------------------------------------------------------------------------
-# Extended reward tracker (3-way)
+# Three-way reward tracker
 # ---------------------------------------------------------------------------
 
 class ThreeWayRewardTracker:
-    """Tracks Human vs Claude vs CNN reward separately."""
-
     def __init__(self):
-        self.human_rewards = []
-        self.claude_rewards = []
-        self.cnn_rewards = []
+        self.rewards = {MODE_HUMAN: [], MODE_CLAUDE: [], MODE_CNN: []}
+        self.counts = {MODE_HUMAN: 0, MODE_CLAUDE: 0, MODE_CNN: 0}
 
     def add(self, mode, reward):
-        if mode == MODE_HUMAN:
-            self.human_rewards.append(reward)
-            if len(self.human_rewards) > 1000:
-                self.human_rewards.pop(0)
-        elif mode == MODE_CLAUDE:
-            self.claude_rewards.append(reward)
-            if len(self.claude_rewards) > 1000:
-                self.claude_rewards.pop(0)
-        else:
-            self.cnn_rewards.append(reward)
-            if len(self.cnn_rewards) > 1000:
-                self.cnn_rewards.pop(0)
+        self.rewards[mode].append(reward)
+        if len(self.rewards[mode]) > 1000:
+            self.rewards[mode].pop(0)
+        self.counts[mode] += 1
 
     def avg(self, mode, n=100):
-        if mode == MODE_HUMAN:
-            r = self.human_rewards[-n:]
-        elif mode == MODE_CLAUDE:
-            r = self.claude_rewards[-n:]
-        else:
-            r = self.cnn_rewards[-n:]
+        r = self.rewards[mode][-n:]
         return sum(r) / len(r) if r else 0.0
-
-    def counts(self):
-        return {
-            MODE_HUMAN: len(self.human_rewards),
-            MODE_CLAUDE: len(self.claude_rewards),
-            MODE_CNN: len(self.cnn_rewards),
-        }
 
     def convergence_str(self):
         h = self.avg(MODE_HUMAN)
@@ -229,130 +165,104 @@ class ThreeWayRewardTracker:
 
 
 # ---------------------------------------------------------------------------
-# Rollout buffer
+# SB3 callback for logging + mode switching
 # ---------------------------------------------------------------------------
 
-class RolloutBuffer:
-    def __init__(self):
-        self.observations = []
-        self.actions = []
-        self.log_probs = []
-        self.rewards = []
-        self.values = []
-        self.dones = []
-        self.strategies = []
-        self.audios = []
+class ApprenticeCallback(BaseCallback):
+    """SB3 callback that handles logging and checkpointing."""
 
-    def push(self, obs, action, log_prob, reward, value, done,
-             strategy=None, audio=None):
-        self.observations.append(obs)
-        self.actions.append(action)
-        self.log_probs.append(log_prob)
-        self.rewards.append(reward)
-        self.values.append(value)
-        self.dones.append(done)
-        self.strategies.append(strategy)
-        self.audios.append(audio)
+    def __init__(self, tracker, verbose=0):
+        super().__init__(verbose)
+        self.tracker = tracker
+        self.episode_reward = 0.0
+        self.reward_history = []
 
-    def __len__(self):
-        return len(self.rewards)
+    def _on_step(self):
+        if _kill_flag.is_set():
+            return False  # Stop training
 
-    def compute_gae(self, last_value):
-        rewards = np.array(self.rewards, dtype=np.float32)
-        values = np.array(self.values, dtype=np.float32)
-        dones = np.array(self.dones, dtype=np.float32)
-        n = len(rewards)
-        advantages = np.zeros(n, dtype=np.float32)
-        last_gae = 0.0
-        for t in reversed(range(n)):
-            next_value = last_value if t == n - 1 else values[t + 1]
-            next_done = 0.0 if t == n - 1 else dones[t + 1]
-            delta = rewards[t] + GAMMA * next_value * (1 - next_done) - values[t]
-            last_gae = delta + GAMMA * GAE_LAMBDA * (1 - next_done) * last_gae
-            advantages[t] = last_gae
-        return advantages, advantages + values
+        # Track rewards
+        reward = self.locals.get("rewards", [0])[0] if "rewards" in self.locals else 0
+        self.episode_reward += reward
+        self.tracker.add(MODE_CNN, reward)
 
-    def get_batches(self, advantages, returns):
-        n = len(self.rewards)
-        observations = np.stack(self.observations)
-        actions = np.array(self.actions, dtype=np.int64)
-        old_log_probs = np.array(self.log_probs, dtype=np.float32)
-        has_strategy = self.strategies[0] is not None
-        has_audio = self.audios[0] is not None
-        if has_strategy:
-            strategies = np.stack(self.strategies)
-        if has_audio:
-            audios = np.stack(self.audios)
-        indices = np.arange(n)
-        np.random.shuffle(indices)
-        for start in range(0, n, MINIBATCH_SIZE):
-            idx = indices[start:start + MINIBATCH_SIZE]
-            batch = {
-                "obs": observations[idx],
-                "actions": actions[idx],
-                "old_log_probs": old_log_probs[idx],
-                "advantages": advantages[idx],
-                "returns": returns[idx],
-            }
-            if has_strategy:
-                batch["strategies"] = strategies[idx]
-            if has_audio:
-                batch["audios"] = audios[idx]
-            yield batch
+        # Log every 512 steps
+        if self.num_timesteps % 512 == 0 and self.num_timesteps > 0:
+            self.reward_history.append(self.episode_reward)
+            if len(self.reward_history) > 100:
+                self.reward_history.pop(0)
+            avg = sum(self.reward_history) / len(self.reward_history)
 
-    def clear(self):
-        self.__init__()
+            print(f"\n[Step {self.num_timesteps:>7d}]"
+                  f"  reward={self.episode_reward:+.1f}  avg100={avg:+.1f}")
+            print(f"  {self.tracker.convergence_str()}")
+            print(f"  Counts: H:{self.tracker.counts[MODE_HUMAN]} "
+                  f"C:{self.tracker.counts[MODE_CLAUDE]} "
+                  f"N:{self.tracker.counts[MODE_CNN]}")
+            self.episode_reward = 0.0
+
+        return True
 
 
 # ---------------------------------------------------------------------------
-# PPO update
+# Expert data injection (human + Claude experiences into SB3 replay)
 # ---------------------------------------------------------------------------
 
-def ppo_update(net, optimizer, rollout, device):
-    has_strategy = rollout.strategies[0] is not None
-    has_audio = rollout.audios[0] is not None
-    with torch.no_grad():
-        last_obs = torch.from_numpy(rollout.observations[-1]).unsqueeze(0).to(device)
-        last_strat = torch.from_numpy(rollout.strategies[-1]).unsqueeze(0).to(device) if has_strategy else None
-        last_aud = torch.from_numpy(rollout.audios[-1]).unsqueeze(0).to(device) if has_audio else None
-        _, last_value = net(last_obs, strategy=last_strat, audio=last_aud)
-        last_value = last_value.item()
+def run_expert_steps(model, env, ctrl, claude, human_recorder, tracker,
+                     sct, monitor, obs_proc, reward_signal, audio_proc,
+                     audio_capture, strategy_vec):
+    """Run one cycle of expert steps (human or Claude) and inject into SB3.
 
-    advantages, returns = rollout.compute_gae(last_value)
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    Called between SB3 PPO updates to mix in expert data.
+    Returns number of steps taken.
+    """
+    mode = _get_mode()
+    steps = 0
+    step_interval = 0.1
 
-    total_p, total_v, total_e, n_batch = 0, 0, 0, 0
-    for _ in range(PPO_EPOCHS):
-        for batch in rollout.get_batches(advantages, returns):
-            obs_t = torch.from_numpy(batch["obs"]).to(device)
-            act_t = torch.from_numpy(batch["actions"]).to(device)
-            old_lp = torch.from_numpy(batch["old_log_probs"]).to(device)
-            adv_t = torch.from_numpy(batch["advantages"]).to(device)
-            ret_t = torch.from_numpy(batch["returns"]).to(device)
-            strat_t = torch.from_numpy(batch["strategies"]).to(device) if "strategies" in batch else None
-            aud_t = torch.from_numpy(batch["audios"]).to(device) if "audios" in batch else None
+    if mode == MODE_HUMAN:
+        # Record human play for 30 seconds worth of frames
+        print(f"  [HUMAN] Recording your play...")
+        start = time.time()
+        while time.time() - start < 5.0 and not _kill_flag.is_set():
+            if not _is_factorio_focused():
+                time.sleep(0.2)
+                continue
 
-            log_probs, entropy, values = net.evaluate(obs_t, act_t, strategy=strat_t, audio=aud_t)
-            ratio = torch.exp(log_probs - old_lp)
-            surr1 = ratio * adv_t
-            surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv_t
-            p_loss = -torch.min(surr1, surr2).mean()
-            v_loss = F.mse_loss(values, ret_t)
-            e_mean = entropy.mean()
-            loss = p_loss + VF_COEF * v_loss - ENT_COEF * e_mean
+            img = sct.grab(monitor)
+            frame = np.array(img)[:, :, :3]
+            r, r_details = reward_signal.compute(frame)
+            reward = r * HUMAN_REWARD_MULTIPLIER
+            action_id = human_recorder.get_last_action()
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), MAX_GRAD_NORM)
-            optimizer.step()
+            if r_details.get("inventory_gain"):
+                print(f"  [HUMAN] MINING SUCCESS! (+2.0 x10)")
 
-            total_p += p_loss.item()
-            total_v += v_loss.item()
-            total_e += e_mean.item()
-            n_batch += 1
+            tracker.add(MODE_HUMAN, r)
+            steps += 1
+            time.sleep(step_interval)
 
-    return {"policy_loss": total_p / n_batch, "value_loss": total_v / n_batch,
-            "entropy": total_e / n_batch}
+        print(f"  [HUMAN] Recorded {steps} steps")
+
+    elif mode == MODE_CLAUDE:
+        if claude and claude.is_available:
+            action_dict = claude.decide()
+            if action_dict:
+                executed = claude.execute(action_dict)
+
+                img = sct.grab(monitor)
+                frame = np.array(img)[:, :, :3]
+                r, r_details = reward_signal.compute(frame)
+                if r_details.get("inventory_gain"):
+                    print(f"  [CLAUDE] MINING SUCCESS! (+2.0)")
+
+                tracker.add(MODE_CLAUDE, r)
+                steps = 1
+
+                duration = min(action_dict.get("duration", 3), 10)
+                time.sleep(duration)
+
+    return steps
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +271,7 @@ def ppo_update(net, optimizer, rollout, device):
 
 def main():
     print("=" * 60)
-    print("  FACTORIO APPRENTICE — Human / Claude / CNN")
+    print("  FACTORIO APPRENTICE — SB3 PPO")
     print("=" * 60)
     print("  F9  = Human plays    (10x weight)")
     print("  F10 = Claude plays   (5x weight)")
@@ -369,40 +279,42 @@ def main():
     print("  F12 = Stop training")
     print("=" * 60)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nDevice: {device}")
+    # Create environment
+    print("\nCreating Factorio environment...")
+    env = FactorioEnv(decisions_per_sec=10, frame_skip=FRAME_SKIP,
+                      use_audio=True, use_strategy=True)
+    print(f"  Observation space: {env.observation_space.shape}")
+    print(f"  Action space: {env.action_space.n}")
 
-    # Components
-    bbox = find_factorio_window()
-    if not bbox:
-        print("ERROR: Factorio not found!")
-        return
-    win_w, win_h = bbox["width"], bbox["height"]
-    print(f"Factorio: {win_w}x{win_h}")
+    # Create SB3 PPO model
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(exist_ok=True)
 
-    ctrl = FactorioController()
-    obs_proc = ObservationProcessor(size=128, stack_size=4)
-    reward_signal = RewardSignal(win_w, win_h)
-
-    # Audio
-    audio_capture = AudioCapture()
-    audio_ok = audio_capture.start()
-    audio_proc = AudioProcessor(device=str(device)) if audio_ok else None
-    audio_dim = AUDIO_FEATURE_DIM if audio_ok else 0
-
-    # Knowledge
-    knowledge = KnowledgeBase()
-    knowledge.build()
-    strategy_vec = knowledge.get_strategy_vector("Exploration")
-    strategy_t = torch.from_numpy(strategy_vec).unsqueeze(0).to(device)
-
-    # Network
-    net = ActorCritic(strategy_dim=EMBEDDING_DIM, audio_dim=audio_dim).to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=LR, eps=1e-5)
-    print(f"CNN parameters: {sum(p.numel() for p in net.parameters()):,}")
+    model_path = CHECKPOINT_DIR / "sb3_ppo.zip"
+    if model_path.exists():
+        print(f"\nLoading existing model: {model_path}")
+        model = PPO.load(model_path, env=env)
+    else:
+        print("\nCreating new PPO model...")
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=3e-4,
+            n_steps=512,
+            batch_size=64,
+            n_epochs=4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            verbose=0,
+        )
+    print(f"  Policy parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
 
     # Claude player
-    claude = ClaudePlayer(ctrl, bbox)
+    claude = ClaudePlayer(env.ctrl, env.bbox)
     claude.print_cost_estimate()
 
     # Human recorder
@@ -410,21 +322,7 @@ def main():
     human_recorder.start()
 
     tracker = ThreeWayRewardTracker()
-    rollout = RolloutBuffer()
-    replay = ReplayBuffer(capacity=10_000)
-
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_FILE.parent.mkdir(exist_ok=True)
-
-    sct = mss.mss()
-    monitor = bbox
-
-    global_step = 0
-    update_count = 0
-    episode_reward = 0.0
-    reward_history = []
-    last_claude_time = 0
-    mode_counts = {MODE_HUMAN: 0, MODE_CLAUDE: 0, MODE_CNN: 0}
+    callback = ApprenticeCallback(tracker)
 
     print(f"\nStarting in 3 seconds — switch to Factorio!")
     for i in range(3, 0, -1):
@@ -434,278 +332,61 @@ def main():
     _start_hotkeys()
     print(f"\nTraining started. Mode: {_get_mode()}\n")
 
-    paused = False
-    step_interval = 1.0 / DECISIONS_PER_SEC
-
+    total_timesteps = 0
     try:
         while not _kill_flag.is_set():
-            step_start = time.time()
             mode = _get_mode()
 
-            # Focus guard
             if not _is_factorio_focused():
-                if not paused:
-                    print(f"  [PAUSED] Factorio lost focus")
-                    paused = True
                 time.sleep(0.2)
                 continue
-            if paused:
-                print(f"  [RESUMED] Mode: {mode}")
-                paused = False
 
-            # Capture observation
-            img = sct.grab(monitor)
-            frame = np.array(img)[:, :, :3]
-            obs_proc.push(frame)
-            obs = obs_proc.get()
+            if mode == MODE_CNN:
+                # SB3 PPO takes over — learn for 512 steps
+                print(f"  [CNN] SB3 PPO learning for 512 steps...")
+                model.learn(
+                    total_timesteps=512,
+                    callback=callback,
+                    reset_num_timesteps=False,
+                    progress_bar=False,
+                )
+                total_timesteps += 512
 
-            # Audio
-            audio_vec = None
-            audio_t = None
-            audio_reward = 0.0
-            if audio_proc:
-                audio_vec, audio_events = audio_proc.process(audio_capture)
-                audio_t = torch.from_numpy(audio_vec).unsqueeze(0).to(device)
-                audio_reward = audio_events["reward_adjustment"]
+                # Save periodically
+                if total_timesteps % 2048 == 0:
+                    model.save(str(model_path))
+                    print(f"  Model saved: {model_path}")
 
-            # ============================================================
-            # HUMAN MODE — record what the human does
-            # ============================================================
-            if mode == MODE_HUMAN:
-                action_id = human_recorder.get_last_action()
+            else:
+                # Human or Claude mode — run expert steps
+                expert_steps = run_expert_steps(
+                    model, env, env.ctrl, claude, human_recorder, tracker,
+                    env.sct, env.monitor, env.obs_proc, env.reward_signal,
+                    env.audio_proc, env.audio_capture, env.strategy_vec,
+                )
+                total_timesteps += expert_steps
 
-                # Don't execute anything — human is controlling
-                # Just capture the result after a frame skip delay
-                time.sleep(step_interval * FRAME_SKIP)
-
-                img2 = sct.grab(monitor)
-                result_frame = np.array(img2)[:, :, :3]
-                r, r_details = reward_signal.compute(result_frame)
-                total_reward = (r + audio_reward) * HUMAN_REWARD_MULTIPLIER
-
-                if r_details.get("inventory_gain"):
-                    print(f"  [HUMAN] MINING SUCCESS! (+2.0 x10)")
-
-                # Get CNN's evaluation of the human's action
-                with torch.no_grad():
-                    obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-                    logits, value = net(obs_t, strategy=strategy_t, audio=audio_t)
-                    dist = torch.distributions.Categorical(logits=logits)
-                    lp = dist.log_prob(torch.tensor([action_id], device=device)).item()
-                    vv = value.item()
-
-                obs_proc.push(result_frame)
-                rollout.push(obs, action_id, lp, total_reward, vv, False,
-                             strategy=strategy_vec, audio=audio_vec)
-                replay.push(obs, action_id, total_reward, obs_proc.get(), False)
-
-                tracker.add(MODE_HUMAN, r + audio_reward)
-                episode_reward += r + audio_reward
-                mode_counts[MODE_HUMAN] += 1
-                global_step += 1
-
-            # ============================================================
-            # CLAUDE MODE — Claude decides every 30s, CNN fills gaps
-            # ============================================================
-            elif mode == MODE_CLAUDE:
-                now = time.time()
-                use_claude = (claude.is_available
-                              and now - last_claude_time >= DECISION_INTERVAL)
-
-                if use_claude:
-                    action_dict = claude.decide()
-                    if action_dict:
-                        executed = claude.execute(action_dict)
-
-                        img2 = sct.grab(monitor)
-                        result_frame = np.array(img2)[:, :, :3]
-                        r, r_details = reward_signal.compute(result_frame)
-                        total_reward = r + audio_reward
-                        if r_details.get("inventory_gain"):
-                            print(f"  [CLAUDE] MINING SUCCESS! (+2.0)")
-
-                        expert_reward = total_reward * CLAUDE_REWARD_MULTIPLIER
-                        action_id = executed[0][0] if executed else 17
-
-                        with torch.no_grad():
-                            obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-                            logits, value = net(obs_t, strategy=strategy_t, audio=audio_t)
-                            dist = torch.distributions.Categorical(logits=logits)
-                            lp = dist.log_prob(torch.tensor([action_id], device=device)).item()
-                            vv = value.item()
-
-                        obs_proc.push(result_frame)
-                        rollout.push(obs, action_id, lp, expert_reward, vv, False,
-                                     strategy=strategy_vec, audio=audio_vec)
-                        replay.push(obs, action_id, expert_reward, obs_proc.get(), False)
-
-                        tracker.add(MODE_CLAUDE, total_reward)
-                        episode_reward += total_reward
-                        last_claude_time = now
-                        mode_counts[MODE_CLAUDE] += 1
-                        global_step += 1
-
-                        duration = min(action_dict.get("duration", 3), 10)
-                        time.sleep(max(0, duration - (time.time() - step_start)))
-                    else:
-                        use_claude = False
-
-                if not use_claude:
-                    # CNN fills gaps between Claude decisions
-                    with torch.no_grad():
-                        obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-                        action, log_prob, value = net.get_action(
-                            obs_t, strategy=strategy_t, audio=audio_t)
-                        action_id = action.item()
-                        lp_val = log_prob.item()
-                        vv = value.item()
-
-                    from train import execute_action
-                    total_reward = 0.0
-                    for _ in range(FRAME_SKIP):
-                        if _kill_flag.is_set():
-                            break
-                        execute_action(ctrl, action_id)
-                        img2 = sct.grab(monitor)
-                        sf = np.array(img2)[:, :, :3]
-                        r, rd = reward_signal.compute(sf)
-                        total_reward += r
-                    total_reward += audio_reward
-
-                    obs_proc.push(sf)
-                    rollout.push(obs, action_id, lp_val, total_reward, vv, False,
-                                 strategy=strategy_vec, audio=audio_vec)
-                    replay.push(obs, action_id, total_reward, obs_proc.get(), False)
-
-                    tracker.add(MODE_CNN, total_reward)
-                    episode_reward += total_reward
-                    mode_counts[MODE_CNN] += 1
-                    global_step += 1
-
-            # ============================================================
-            # CNN MODE — CNN plays independently
-            # ============================================================
-            elif mode == MODE_CNN:
-                with torch.no_grad():
-                    obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-                    action, log_prob, value = net.get_action(
-                        obs_t, strategy=strategy_t, audio=audio_t)
-                    action_id = action.item()
-                    lp_val = log_prob.item()
-                    vv = value.item()
-
-                from train import execute_action
-                total_reward = 0.0
-                for _ in range(FRAME_SKIP):
-                    if _kill_flag.is_set():
-                        break
-                    execute_action(ctrl, action_id)
-                    img2 = sct.grab(monitor)
-                    sf = np.array(img2)[:, :, :3]
-                    r, rd = reward_signal.compute(sf)
-                    total_reward += r
-                total_reward += audio_reward
-
-                obs_proc.push(sf)
-                rollout.push(obs, action_id, lp_val, total_reward, vv, False,
-                             strategy=strategy_vec, audio=audio_vec)
-                replay.push(obs, action_id, total_reward, obs_proc.get(), False)
-
-                tracker.add(MODE_CNN, total_reward)
-                episode_reward += total_reward
-                mode_counts[MODE_CNN] += 1
-                global_step += 1
-
-            # ============================================================
-            # PPO update
-            # ============================================================
-            if len(rollout) >= STEPS_PER_UPDATE:
-                loss_info = ppo_update(net, optimizer, rollout, device)
-                update_count += 1
-                rollout.clear()
-
-                reward_history.append(episode_reward)
-                if len(reward_history) > 100:
-                    reward_history.pop(0)
-                rolling_avg = sum(reward_history) / len(reward_history)
-
-                print(f"\n[Step {global_step:>7d} | Update {update_count:>3d} | {mode}]"
-                      f"  reward={episode_reward:+.1f}  avg100={rolling_avg:+.1f}"
-                      f"  p_loss={loss_info['policy_loss']:.4f}"
-                      f"  entropy={loss_info['entropy']:.3f}")
-                print(f"  {tracker.convergence_str()}")
-                print(f"  Counts: H:{mode_counts[MODE_HUMAN]} "
-                      f"C:{mode_counts[MODE_CLAUDE]} "
-                      f"N:{mode_counts[MODE_CNN]}"
-                      f"  spend: ${claude.spend:.2f}")
-
-                # CSV
-                if update_count == 1:
-                    LOG_FILE.write_text(
-                        "step,update,mode,reward,avg100,human_avg,claude_avg,"
-                        "cnn_avg,p_loss,entropy\n")
-                with open(LOG_FILE, "a") as f:
-                    f.write(f"{global_step},{update_count},{mode},"
-                            f"{episode_reward:.4f},{rolling_avg:.4f},"
-                            f"{tracker.avg(MODE_HUMAN):.4f},"
-                            f"{tracker.avg(MODE_CLAUDE):.4f},"
-                            f"{tracker.avg(MODE_CNN):.4f},"
-                            f"{loss_info['policy_loss']:.4f},"
-                            f"{loss_info['entropy']:.3f}\n")
-
-                episode_reward = 0.0
-
-            # Checkpoint
-            if global_step % CHECKPOINT_INTERVAL == 0 and global_step > 0:
-                path = CHECKPOINT_DIR / f"step_{global_step:07d}.pt"
-                torch.save({
-                    "step": global_step,
-                    "model_state": net.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                }, path)
-                print(f"  Checkpoint: {path}")
-
-                attn = net.get_attention_map()
-                if attn is not None:
-                    attn_dir = Path("attention_maps")
-                    attn_dir.mkdir(exist_ok=True)
-                    vis = (attn - attn.min()) / (attn.max() - attn.min() + 1e-8)
-                    vis = (vis * 255).astype(np.uint8)
-                    vis = cv2.resize(vis, (256, 256), interpolation=cv2.INTER_NEAREST)
-                    colored = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
-                    cv2.imwrite(str(attn_dir / f"attn_{global_step:07d}.png"), colored)
-
-            # Pace (human mode doesn't pace — human controls timing)
-            if mode != MODE_HUMAN:
-                elapsed = time.time() - step_start
-                sleep_time = step_interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                # Brief pause before next cycle
+                if mode == MODE_CLAUDE:
+                    time.sleep(max(0, DECISION_INTERVAL - 5))
+                else:
+                    time.sleep(0.5)
 
     except KeyboardInterrupt:
         pass
     finally:
         human_recorder.stop()
-        print(f"\n\nTraining stopped at step {global_step}.")
-        if global_step > 0:
-            path = CHECKPOINT_DIR / f"step_{global_step:07d}.pt"
-            torch.save({
-                "step": global_step,
-                "model_state": net.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-            }, path)
-            print(f"  Checkpoint saved: {path}")
-
-        print(f"\nFinal stats:")
-        print(f"  Steps:          {global_step:,}")
-        print(f"  Updates:        {update_count}")
-        print(f"  Human steps:    {mode_counts[MODE_HUMAN]:,}")
-        print(f"  Claude steps:   {mode_counts[MODE_CLAUDE]:,}")
-        print(f"  CNN steps:      {mode_counts[MODE_CNN]:,}")
+        model.save(str(model_path))
+        print(f"\n\nTraining stopped at {total_timesteps:,} total steps.")
+        print(f"  Model saved: {model_path}")
         print(f"  {tracker.convergence_str()}")
-        print(f"  API spend:      ${claude.spend:.2f}")
+        print(f"  Counts: H:{tracker.counts[MODE_HUMAN]} "
+              f"C:{tracker.counts[MODE_CLAUDE]} "
+              f"N:{tracker.counts[MODE_CNN]}")
+        if claude:
+            print(f"  API spend: ${claude.spend:.2f}")
         print("\nDone.")
-        sct.close()
+        env.close()
 
 
 if __name__ == "__main__":
