@@ -1,14 +1,15 @@
 """
-Apprentice training loop — Claude plays, CNN watches and learns.
+Apprentice training loop — three-mode training with seamless switching.
 
-Claude is the expert player making intelligent decisions every 5 seconds.
-The CNN observes every action at 5x reward weight and learns to replicate
-Claude's play through PPO updates. Over time Claude fades out and the CNN
-takes over, playing independently.
+F9  — Human plays, CNN watches at 10x weight (best training data)
+F10 — Claude plays, CNN watches at 5x weight
+F11 — CNN plays independently at 1x weight
+F12 — Kill switch (stop training)
+
+All three modes feed the same PPO buffer and training loop.
 
 Usage:
-    python apprentice.py              # Full system
-    python apprentice.py --baseline   # CNN only (no Claude, for comparison)
+    python apprentice.py
 """
 
 import ctypes
@@ -17,6 +18,7 @@ import time
 import threading
 import random
 from pathlib import Path
+from datetime import datetime
 
 import cv2
 import mss
@@ -24,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from pynput import keyboard as kb
+from pynput import mouse as ms
 
 from capture import find_factorio_window, AudioCapture
 from control import FactorioController
@@ -55,25 +58,58 @@ DECISIONS_PER_SEC = 10
 CHECKPOINT_INTERVAL = 1000
 FRAME_SKIP = 4
 
+HUMAN_REWARD_MULTIPLIER = 10.0
+CLAUDE_REWARD_MULTIPLIER = EXPERT_REWARD_MULTIPLIER  # 5.0
+
 CHECKPOINT_DIR = Path("checkpoints/apprentice")
 LOG_FILE = Path("logs/apprentice.csv")
 
+# Modes
+MODE_HUMAN = "HUMAN"
+MODE_CLAUDE = "CLAUDE"
+MODE_CNN = "CNN"
+
 
 # ---------------------------------------------------------------------------
-# Safety
+# Mode switcher + kill switch
 # ---------------------------------------------------------------------------
 
 _kill_flag = threading.Event()
+_current_mode = MODE_CLAUDE  # Default start mode
+_mode_lock = threading.Lock()
 
 
-def _start_kill_switch():
+def _get_mode():
+    with _mode_lock:
+        return _current_mode
+
+
+def _set_mode(mode):
+    global _current_mode
+    with _mode_lock:
+        old = _current_mode
+        _current_mode = mode
+    if old != mode:
+        print(f"\n  *** MODE SWITCH: {old} -> {mode} ***\n")
+        _log(f"MODE SWITCH: {old} -> {mode}")
+
+
+def _start_hotkeys():
+    """Listen for F9/F10/F11 mode switches and F12 kill."""
     def on_press(key):
-        if key == kb.Key.f12:
+        if key == kb.Key.f9:
+            _set_mode(MODE_HUMAN)
+        elif key == kb.Key.f10:
+            _set_mode(MODE_CLAUDE)
+        elif key == kb.Key.f11:
+            _set_mode(MODE_CNN)
+        elif key == kb.Key.f12:
             print("\n\n*** F12 KILL SWITCH ***")
             _kill_flag.set()
             return False
     listener = kb.Listener(on_press=on_press, daemon=True)
     listener.start()
+    return listener
 
 
 def _is_factorio_focused():
@@ -85,6 +121,111 @@ def _is_factorio_focused():
     buf = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, buf, length + 1)
     return buf.value.lower().startswith("factorio")
+
+
+# ---------------------------------------------------------------------------
+# Human input recorder
+# ---------------------------------------------------------------------------
+
+class HumanRecorder:
+    """Records human mouse and keyboard inputs for training data."""
+
+    def __init__(self):
+        self._last_action_id = 17  # no-op
+        self._last_action_time = time.time()
+        self._lock = threading.Lock()
+        self._mouse_listener = None
+        self._active = False
+
+    def start(self):
+        """Start recording human inputs."""
+        self._active = True
+        # Mouse listener runs in background
+        self._mouse_listener = ms.Listener(
+            on_click=self._on_click,
+            daemon=True,
+        )
+        self._mouse_listener.start()
+
+    def stop(self):
+        self._active = False
+        if self._mouse_listener:
+            self._mouse_listener.stop()
+
+    def _on_click(self, x, y, button, pressed):
+        if not self._active or _get_mode() != MODE_HUMAN:
+            return
+        if pressed:
+            with self._lock:
+                if button == ms.Button.left:
+                    self._last_action_id = 8
+                elif button == ms.Button.right:
+                    self._last_action_id = 9
+                self._last_action_time = time.time()
+
+    def record_key(self, key_char):
+        """Record a key press (called from the main hotkey listener)."""
+        key_map = {"w": 0, "a": 1, "s": 2, "d": 3, "e": 15, "q": 16, " ": 14}
+        with self._lock:
+            self._last_action_id = key_map.get(key_char, 17)
+            self._last_action_time = time.time()
+
+    def get_last_action(self):
+        """Get the most recent human action ID."""
+        with self._lock:
+            return self._last_action_id
+
+
+# ---------------------------------------------------------------------------
+# Extended reward tracker (3-way)
+# ---------------------------------------------------------------------------
+
+class ThreeWayRewardTracker:
+    """Tracks Human vs Claude vs CNN reward separately."""
+
+    def __init__(self):
+        self.human_rewards = []
+        self.claude_rewards = []
+        self.cnn_rewards = []
+
+    def add(self, mode, reward):
+        if mode == MODE_HUMAN:
+            self.human_rewards.append(reward)
+            if len(self.human_rewards) > 1000:
+                self.human_rewards.pop(0)
+        elif mode == MODE_CLAUDE:
+            self.claude_rewards.append(reward)
+            if len(self.claude_rewards) > 1000:
+                self.claude_rewards.pop(0)
+        else:
+            self.cnn_rewards.append(reward)
+            if len(self.cnn_rewards) > 1000:
+                self.cnn_rewards.pop(0)
+
+    def avg(self, mode, n=100):
+        if mode == MODE_HUMAN:
+            r = self.human_rewards[-n:]
+        elif mode == MODE_CLAUDE:
+            r = self.claude_rewards[-n:]
+        else:
+            r = self.cnn_rewards[-n:]
+        return sum(r) / len(r) if r else 0.0
+
+    def counts(self):
+        return {
+            MODE_HUMAN: len(self.human_rewards),
+            MODE_CLAUDE: len(self.claude_rewards),
+            MODE_CNN: len(self.cnn_rewards),
+        }
+
+    def convergence_str(self):
+        h = self.avg(MODE_HUMAN)
+        c = self.avg(MODE_CLAUDE)
+        n = self.avg(MODE_CNN)
+        best = max(h, c) if max(h, c) > 0 else 1.0
+        conv = n / best if best > 0 else 0.0
+        return (f"Human:{h:+.3f}  Claude:{c:+.3f}  CNN:{n:+.3f}  "
+                f"CNN/best: {conv:.1%}")
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +361,14 @@ def ppo_update(net, optimizer, rollout, device):
 
 def main():
     print("=" * 60)
-    print("  FACTORIO APPRENTICE — Claude plays, CNN learns")
+    print("  FACTORIO APPRENTICE — Human / Claude / CNN")
+    print("=" * 60)
+    print("  F9  = Human plays    (10x weight)")
+    print("  F10 = Claude plays   (5x weight)")
+    print("  F11 = CNN plays      (1x weight)")
+    print("  F12 = Stop training")
     print("=" * 60)
 
-    baseline_mode = "--baseline" in os.sys.argv
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
 
@@ -254,25 +399,23 @@ def main():
     # Network
     net = ActorCritic(strategy_dim=EMBEDDING_DIM, audio_dim=audio_dim).to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=LR, eps=1e-5)
-    total_params = sum(p.numel() for p in net.parameters())
-    print(f"CNN parameters: {total_params:,}")
+    print(f"CNN parameters: {sum(p.numel() for p in net.parameters()):,}")
 
     # Claude player
-    claude = None if baseline_mode else ClaudePlayer(ctrl, bbox)
-    if claude:
-        print("Claude player: ACTIVE")
-    else:
-        print("Claude player: DISABLED (baseline mode)")
+    claude = ClaudePlayer(ctrl, bbox)
+    claude.print_cost_estimate()
 
-    reward_tracker = RewardTracker()
+    # Human recorder
+    human_recorder = HumanRecorder()
+    human_recorder.start()
+
+    tracker = ThreeWayRewardTracker()
     rollout = RolloutBuffer()
     replay = ReplayBuffer(capacity=10_000)
 
-    # Checkpoints
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_FILE.parent.mkdir(exist_ok=True)
 
-    # Screen capture
     sct = mss.mss()
     monitor = bbox
 
@@ -281,17 +424,15 @@ def main():
     episode_reward = 0.0
     reward_history = []
     last_claude_time = 0
-    claude_decisions = 0
-    cnn_decisions = 0
+    mode_counts = {MODE_HUMAN: 0, MODE_CLAUDE: 0, MODE_CNN: 0}
 
-    # Countdown
-    print(f"\nStarting in 3 seconds — switch to Factorio! F12 to stop.")
+    print(f"\nStarting in 3 seconds — switch to Factorio!")
     for i in range(3, 0, -1):
         print(f"  {i}...")
         time.sleep(1)
 
-    _start_kill_switch()
-    print("\nTraining started.\n")
+    _start_hotkeys()
+    print(f"\nTraining started. Mode: {_get_mode()}\n")
 
     paused = False
     step_interval = 1.0 / DECISIONS_PER_SEC
@@ -299,16 +440,17 @@ def main():
     try:
         while not _kill_flag.is_set():
             step_start = time.time()
+            mode = _get_mode()
 
             # Focus guard
             if not _is_factorio_focused():
                 if not paused:
-                    print("  [PAUSED] Factorio lost focus")
+                    print(f"  [PAUSED] Factorio lost focus")
                     paused = True
                 time.sleep(0.2)
                 continue
             if paused:
-                print("  [RESUMED]")
+                print(f"  [RESUMED] Mode: {mode}")
                 paused = False
 
             # Capture observation
@@ -326,74 +468,132 @@ def main():
                 audio_t = torch.from_numpy(audio_vec).unsqueeze(0).to(device)
                 audio_reward = audio_events["reward_adjustment"]
 
-            # Decide: Claude or CNN?
-            now = time.time()
-            claude_ratio = get_claude_ratio(global_step) if claude else 0.0
-            use_claude = (claude
-                          and random.random() < claude_ratio
-                          and now - last_claude_time >= DECISION_INTERVAL)
+            # ============================================================
+            # HUMAN MODE — record what the human does
+            # ============================================================
+            if mode == MODE_HUMAN:
+                action_id = human_recorder.get_last_action()
 
-            if use_claude:
-                # --- CLAUDE PLAYS ---
-                action_dict = claude.decide()
-                if action_dict:
-                    reason = action_dict.get("reason", "")[:60]
-                    action_type = action_dict.get("action_type", "?")
-                    print(f"  [CLAUDE] {action_type}: {reason}")
+                # Don't execute anything — human is controlling
+                # Just capture the result after a frame skip delay
+                time.sleep(step_interval * FRAME_SKIP)
 
-                    # Execute Claude's action
-                    executed = claude.execute(action_dict)
+                img2 = sct.grab(monitor)
+                result_frame = np.array(img2)[:, :, :3]
+                r, r_details = reward_signal.compute(result_frame)
+                total_reward = (r + audio_reward) * HUMAN_REWARD_MULTIPLIER
 
-                    # Capture result
-                    img2 = sct.grab(monitor)
-                    result_frame = np.array(img2)[:, :, :3]
-                    r, r_details = reward_signal.compute(result_frame)
-                    total_reward = r + audio_reward
-                    if r_details.get("inventory_gain"):
-                        print(f"  [CLAUDE] MINING SUCCESS! (+2.0)")
+                if r_details.get("inventory_gain"):
+                    print(f"  [HUMAN] MINING SUCCESS! (+2.0 x10)")
 
-                    # Store at expert weight
-                    expert_reward = total_reward * EXPERT_REWARD_MULTIPLIER
-                    action_id = executed[0][0] if executed else 17
-
-                    # Get CNN's opinion for the log_prob/value
-                    with torch.no_grad():
-                        obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-                        logits, value = net(obs_t, strategy=strategy_t, audio=audio_t)
-                        dist = torch.distributions.Categorical(logits=logits)
-                        log_prob = dist.log_prob(torch.tensor([action_id], device=device)).item()
-                        value_val = value.item()
-
-                    obs_proc.push(result_frame)
-                    next_obs = obs_proc.get()
-
-                    rollout.push(obs, action_id, log_prob, expert_reward, value_val, False,
-                                 strategy=strategy_vec, audio=audio_vec)
-                    replay.push(obs, action_id, expert_reward, next_obs, False)
-
-                    reward_tracker.add_claude(total_reward)
-                    episode_reward += total_reward
-                    last_claude_time = now
-                    claude_decisions += 1
-                    global_step += 1
-
-                    # Sleep for the action duration
-                    duration = min(action_dict.get("duration", 3), 10)
-                    time.sleep(max(0, duration - (time.time() - step_start)))
-                else:
-                    # Claude failed to decide, fall through to CNN
-                    use_claude = False
-
-            if not use_claude:
-                # --- CNN PLAYS ---
+                # Get CNN's evaluation of the human's action
                 with torch.no_grad():
                     obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-                    action, log_prob, value = net.get_action(obs_t, strategy=strategy_t, audio=audio_t)
-                    action_id = action.item()
-                    log_prob_val = log_prob.item()
-                    value_val = value.item()
+                    logits, value = net(obs_t, strategy=strategy_t, audio=audio_t)
+                    dist = torch.distributions.Categorical(logits=logits)
+                    lp = dist.log_prob(torch.tensor([action_id], device=device)).item()
+                    vv = value.item()
 
-                # Execute with frame skip
+                obs_proc.push(result_frame)
+                rollout.push(obs, action_id, lp, total_reward, vv, False,
+                             strategy=strategy_vec, audio=audio_vec)
+                replay.push(obs, action_id, total_reward, obs_proc.get(), False)
+
+                tracker.add(MODE_HUMAN, r + audio_reward)
+                episode_reward += r + audio_reward
+                mode_counts[MODE_HUMAN] += 1
+                global_step += 1
+
+            # ============================================================
+            # CLAUDE MODE — Claude decides every 30s, CNN fills gaps
+            # ============================================================
+            elif mode == MODE_CLAUDE:
+                now = time.time()
+                use_claude = (claude.is_available
+                              and now - last_claude_time >= DECISION_INTERVAL)
+
+                if use_claude:
+                    action_dict = claude.decide()
+                    if action_dict:
+                        executed = claude.execute(action_dict)
+
+                        img2 = sct.grab(monitor)
+                        result_frame = np.array(img2)[:, :, :3]
+                        r, r_details = reward_signal.compute(result_frame)
+                        total_reward = r + audio_reward
+                        if r_details.get("inventory_gain"):
+                            print(f"  [CLAUDE] MINING SUCCESS! (+2.0)")
+
+                        expert_reward = total_reward * CLAUDE_REWARD_MULTIPLIER
+                        action_id = executed[0][0] if executed else 17
+
+                        with torch.no_grad():
+                            obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
+                            logits, value = net(obs_t, strategy=strategy_t, audio=audio_t)
+                            dist = torch.distributions.Categorical(logits=logits)
+                            lp = dist.log_prob(torch.tensor([action_id], device=device)).item()
+                            vv = value.item()
+
+                        obs_proc.push(result_frame)
+                        rollout.push(obs, action_id, lp, expert_reward, vv, False,
+                                     strategy=strategy_vec, audio=audio_vec)
+                        replay.push(obs, action_id, expert_reward, obs_proc.get(), False)
+
+                        tracker.add(MODE_CLAUDE, total_reward)
+                        episode_reward += total_reward
+                        last_claude_time = now
+                        mode_counts[MODE_CLAUDE] += 1
+                        global_step += 1
+
+                        duration = min(action_dict.get("duration", 3), 10)
+                        time.sleep(max(0, duration - (time.time() - step_start)))
+                    else:
+                        use_claude = False
+
+                if not use_claude:
+                    # CNN fills gaps between Claude decisions
+                    with torch.no_grad():
+                        obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
+                        action, log_prob, value = net.get_action(
+                            obs_t, strategy=strategy_t, audio=audio_t)
+                        action_id = action.item()
+                        lp_val = log_prob.item()
+                        vv = value.item()
+
+                    from train import execute_action
+                    total_reward = 0.0
+                    for _ in range(FRAME_SKIP):
+                        if _kill_flag.is_set():
+                            break
+                        execute_action(ctrl, action_id)
+                        img2 = sct.grab(monitor)
+                        sf = np.array(img2)[:, :, :3]
+                        r, rd = reward_signal.compute(sf)
+                        total_reward += r
+                    total_reward += audio_reward
+
+                    obs_proc.push(sf)
+                    rollout.push(obs, action_id, lp_val, total_reward, vv, False,
+                                 strategy=strategy_vec, audio=audio_vec)
+                    replay.push(obs, action_id, total_reward, obs_proc.get(), False)
+
+                    tracker.add(MODE_CNN, total_reward)
+                    episode_reward += total_reward
+                    mode_counts[MODE_CNN] += 1
+                    global_step += 1
+
+            # ============================================================
+            # CNN MODE — CNN plays independently
+            # ============================================================
+            elif mode == MODE_CNN:
+                with torch.no_grad():
+                    obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
+                    action, log_prob, value = net.get_action(
+                        obs_t, strategy=strategy_t, audio=audio_t)
+                    action_id = action.item()
+                    lp_val = log_prob.item()
+                    vv = value.item()
+
                 from train import execute_action
                 total_reward = 0.0
                 for _ in range(FRAME_SKIP):
@@ -401,26 +601,24 @@ def main():
                         break
                     execute_action(ctrl, action_id)
                     img2 = sct.grab(monitor)
-                    skip_frame = np.array(img2)[:, :, :3]
-                    r, r_details = reward_signal.compute(skip_frame)
+                    sf = np.array(img2)[:, :, :3]
+                    r, rd = reward_signal.compute(sf)
                     total_reward += r
-                    if r_details.get("inventory_gain"):
-                        print(f"  [CNN] MINING SUCCESS! (+2.0)")
                 total_reward += audio_reward
 
-                obs_proc.push(skip_frame)
-                next_obs = obs_proc.get()
-
-                rollout.push(obs, action_id, log_prob_val, total_reward, value_val, False,
+                obs_proc.push(sf)
+                rollout.push(obs, action_id, lp_val, total_reward, vv, False,
                              strategy=strategy_vec, audio=audio_vec)
-                replay.push(obs, action_id, total_reward, next_obs, False)
+                replay.push(obs, action_id, total_reward, obs_proc.get(), False)
 
-                reward_tracker.add_cnn(total_reward)
+                tracker.add(MODE_CNN, total_reward)
                 episode_reward += total_reward
-                cnn_decisions += 1
+                mode_counts[MODE_CNN] += 1
                 global_step += 1
 
+            # ============================================================
             # PPO update
+            # ============================================================
             if len(rollout) >= STEPS_PER_UPDATE:
                 loss_info = ppo_update(net, optimizer, rollout, device)
                 update_count += 1
@@ -431,29 +629,28 @@ def main():
                     reward_history.pop(0)
                 rolling_avg = sum(reward_history) / len(reward_history)
 
-                c_avg = reward_tracker.claude_avg()
-                n_avg = reward_tracker.cnn_avg()
-                conv = reward_tracker.convergence()
-                ratio = get_claude_ratio(global_step)
-
-                print(f"\n[Step {global_step:>7d} | Update {update_count:>3d}]"
+                print(f"\n[Step {global_step:>7d} | Update {update_count:>3d} | {mode}]"
                       f"  reward={episode_reward:+.1f}  avg100={rolling_avg:+.1f}"
                       f"  p_loss={loss_info['policy_loss']:.4f}"
                       f"  entropy={loss_info['entropy']:.3f}")
-                print(f"  Claude avg: {c_avg:+.3f}  CNN avg: {n_avg:+.3f}"
-                      f"  convergence: {conv:.1%}"
-                      f"  ratio: {ratio:.0%} Claude / {1-ratio:.0%} CNN"
-                      f"  (C:{claude_decisions} N:{cnn_decisions})")
+                print(f"  {tracker.convergence_str()}")
+                print(f"  Counts: H:{mode_counts[MODE_HUMAN]} "
+                      f"C:{mode_counts[MODE_CLAUDE]} "
+                      f"N:{mode_counts[MODE_CNN]}"
+                      f"  spend: ${claude.spend:.2f}")
 
-                # CSV log
+                # CSV
                 if update_count == 1:
                     LOG_FILE.write_text(
-                        "step,update,reward,avg100,claude_avg,cnn_avg,convergence,"
-                        "claude_ratio,p_loss,entropy\n")
+                        "step,update,mode,reward,avg100,human_avg,claude_avg,"
+                        "cnn_avg,p_loss,entropy\n")
                 with open(LOG_FILE, "a") as f:
-                    f.write(f"{global_step},{update_count},{episode_reward:.4f},"
-                            f"{rolling_avg:.4f},{c_avg:.4f},{n_avg:.4f},{conv:.4f},"
-                            f"{ratio:.2f},{loss_info['policy_loss']:.4f},"
+                    f.write(f"{global_step},{update_count},{mode},"
+                            f"{episode_reward:.4f},{rolling_avg:.4f},"
+                            f"{tracker.avg(MODE_HUMAN):.4f},"
+                            f"{tracker.avg(MODE_CLAUDE):.4f},"
+                            f"{tracker.avg(MODE_CNN):.4f},"
+                            f"{loss_info['policy_loss']:.4f},"
                             f"{loss_info['entropy']:.3f}\n")
 
                 episode_reward = 0.0
@@ -468,7 +665,6 @@ def main():
                 }, path)
                 print(f"  Checkpoint: {path}")
 
-                # Attention map
                 attn = net.get_attention_map()
                 if attn is not None:
                     attn_dir = Path("attention_maps")
@@ -479,8 +675,8 @@ def main():
                     colored = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
                     cv2.imwrite(str(attn_dir / f"attn_{global_step:07d}.png"), colored)
 
-            # Pace
-            if not use_claude:
+            # Pace (human mode doesn't pace — human controls timing)
+            if mode != MODE_HUMAN:
                 elapsed = time.time() - step_start
                 sleep_time = step_interval - elapsed
                 if sleep_time > 0:
@@ -489,6 +685,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        human_recorder.stop()
         print(f"\n\nTraining stopped at step {global_step}.")
         if global_step > 0:
             path = CHECKPOINT_DIR / f"step_{global_step:07d}.pt"
@@ -500,14 +697,13 @@ def main():
             print(f"  Checkpoint saved: {path}")
 
         print(f"\nFinal stats:")
-        print(f"  Steps:            {global_step:,}")
-        print(f"  Updates:          {update_count}")
-        print(f"  Claude decisions: {claude_decisions:,}")
-        print(f"  CNN decisions:    {cnn_decisions:,}")
-        print(f"  Claude avg100:    {reward_tracker.claude_avg():+.3f}")
-        print(f"  CNN avg100:       {reward_tracker.cnn_avg():+.3f}")
-        print(f"  Convergence:      {reward_tracker.convergence():.1%}")
-        print(f"  Current ratio:    {get_claude_ratio(global_step):.0%} Claude")
+        print(f"  Steps:          {global_step:,}")
+        print(f"  Updates:        {update_count}")
+        print(f"  Human steps:    {mode_counts[MODE_HUMAN]:,}")
+        print(f"  Claude steps:   {mode_counts[MODE_CLAUDE]:,}")
+        print(f"  CNN steps:      {mode_counts[MODE_CNN]:,}")
+        print(f"  {tracker.convergence_str()}")
+        print(f"  API spend:      ${claude.spend:.2f}")
         print("\nDone.")
         sct.close()
 
