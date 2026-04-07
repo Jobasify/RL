@@ -50,6 +50,7 @@ class Advisor:
         self._thread = None
         self._client = None
         self._last_advice = ""
+        self._new_advice = None  # Set when fresh advice arrives, consumed by translator
 
         ADVISOR_LOG.parent.mkdir(exist_ok=True)
 
@@ -142,6 +143,7 @@ class Advisor:
 
                 with self._lock:
                     self._strategy_vec = embedding
+                    self._new_advice = advice
 
                 # Log
                 self._log(f"ADVICE:\n{advice}")
@@ -176,6 +178,13 @@ class Advisor:
         """Get the latest advisor strategy vector, or None if not yet available."""
         with self._lock:
             return self._strategy_vec
+
+    def consume_advice(self):
+        """Return new advice text if available, then clear it. Thread-safe."""
+        with self._lock:
+            advice = self._new_advice
+            self._new_advice = None
+            return advice
 
 
 def main():

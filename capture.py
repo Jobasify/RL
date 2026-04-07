@@ -113,6 +113,18 @@ class AudioCapture:
         except Exception as e:
             print(f"Audio recording error: {e}")
 
+    def get_recent_audio(self, seconds=2):
+        """Return the last N seconds of audio as a numpy array (samples, channels).
+        Returns None if audio not available."""
+        if not self._speaker:
+            return None
+        with self._lock:
+            chunks_needed = seconds * 10
+            snapshot = list(self._buffer[-chunks_needed:])
+        if not snapshot:
+            return None
+        return np.concatenate(snapshot, axis=0)
+
     def save_snapshot(self, filepath, seconds=3):
         """Save the last N seconds of audio to a WAV file."""
         if not self._speaker:

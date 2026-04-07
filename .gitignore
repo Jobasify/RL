@@ -3,6 +3,7 @@ captures/
 checkpoints/
 knowledge_cache/
 logs/
+attention_maps/
 *.wav
 *.png
 *.npz

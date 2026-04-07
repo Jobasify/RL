@@ -28,6 +28,9 @@ from memory import ReplayBuffer
 from network import ActorCritic, NUM_ACTIONS, ACTION_NAMES
 from knowledge import KnowledgeBase, EMBEDDING_DIM
 from advisor import Advisor
+from translator import ActionTranslator
+from audio import AudioProcessor, AUDIO_FEATURE_DIM
+from capture import AudioCapture
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +254,10 @@ class RolloutBuffer:
         self.values = []
         self.dones = []
         self.strategies = []
+        self.audios = []
 
-    def push(self, obs, action, log_prob, reward, value, done, strategy=None):
+    def push(self, obs, action, log_prob, reward, value, done,
+             strategy=None, audio=None):
         self.observations.append(obs)
         self.actions.append(action)
         self.log_probs.append(log_prob)
@@ -260,6 +265,7 @@ class RolloutBuffer:
         self.values.append(value)
         self.dones.append(done)
         self.strategies.append(strategy)
+        self.audios.append(audio)
 
     def __len__(self):
         return len(self.rewards)
@@ -291,8 +297,11 @@ class RolloutBuffer:
         actions = np.array(self.actions, dtype=np.int64)
         old_log_probs = np.array(self.log_probs, dtype=np.float32)
         has_strategy = self.strategies[0] is not None
+        has_audio = self.audios[0] is not None
         if has_strategy:
             strategies = np.stack(self.strategies)
+        if has_audio:
+            audios = np.stack(self.audios)
 
         indices = np.arange(n)
         np.random.shuffle(indices)
@@ -309,6 +318,8 @@ class RolloutBuffer:
             }
             if has_strategy:
                 batch["strategies"] = strategies[idx]
+            if has_audio:
+                batch["audios"] = audios[idx]
             yield batch
 
     def clear(self):
@@ -393,12 +404,16 @@ def ppo_update(net, optimizer, rollout, device):
     """Run PPO update on collected rollout. Returns mean loss, entropy."""
     # Bootstrap value for last state
     has_strategy = rollout.strategies[0] is not None
+    has_audio = rollout.audios[0] is not None
     with torch.no_grad():
         last_obs = torch.from_numpy(rollout.observations[-1]).unsqueeze(0).to(device)
         last_strat = None
+        last_aud = None
         if has_strategy:
             last_strat = torch.from_numpy(rollout.strategies[-1]).unsqueeze(0).to(device)
-        _, last_value = net(last_obs, strategy=last_strat)
+        if has_audio:
+            last_aud = torch.from_numpy(rollout.audios[-1]).unsqueeze(0).to(device)
+        _, last_value = net(last_obs, strategy=last_strat, audio=last_aud)
         last_value = last_value.item()
 
     advantages, returns = rollout.compute_gae(last_value)
@@ -419,10 +434,13 @@ def ppo_update(net, optimizer, rollout, device):
             adv_t = torch.from_numpy(batch["advantages"]).to(device)
             ret_t = torch.from_numpy(batch["returns"]).to(device)
             strat_t = None
+            aud_t = None
             if "strategies" in batch:
                 strat_t = torch.from_numpy(batch["strategies"]).to(device)
+            if "audios" in batch:
+                aud_t = torch.from_numpy(batch["audios"]).to(device)
 
-            log_probs, entropy, values = net.evaluate(obs_t, act_t, strategy=strat_t)
+            log_probs, entropy, values = net.evaluate(obs_t, act_t, strategy=strat_t, audio=aud_t)
 
             # Policy loss (clipped surrogate)
             ratio = torch.exp(log_probs - old_lp_t)
@@ -522,17 +540,26 @@ def main():
     log_file = Path(f"logs/{experiment_tag}.csv")
     log_file.parent.mkdir(exist_ok=True)
 
+    # --- Audio system ---
+    print("\nStarting audio capture...")
+    audio_capture = AudioCapture()
+    audio_ok = audio_capture.start()
+    audio_proc = AudioProcessor(device=str(device)) if audio_ok else None
+    audio_dim = AUDIO_FEATURE_DIM if audio_ok else 0
+    if not audio_ok:
+        print("  Audio disabled — running without audio features")
+
     if baseline_mode:
         print("\n*** BASELINE MODE — pure CNN, no knowledge vector ***")
         knowledge = None
         strategy_vec = None
         strategy_t = None
-        net = ActorCritic(strategy_dim=0).to(device)
+        net = ActorCritic(strategy_dim=0, audio_dim=audio_dim).to(device)
     else:
-        print("\n*** KNOWLEDGE MODE — CNN + strategy vector ***")
+        print("\n*** KNOWLEDGE MODE — CNN + strategy + audio ***")
         knowledge = KnowledgeBase()
         knowledge.build()
-        net = ActorCritic(strategy_dim=EMBEDDING_DIM).to(device)
+        net = ActorCritic(strategy_dim=EMBEDDING_DIM, audio_dim=audio_dim).to(device)
 
     total_params = sum(p.numel() for p in net.parameters())
     print(f"  Parameters: {total_params:,}")
@@ -541,6 +568,14 @@ def main():
 
     replay = ReplayBuffer(capacity=10_000)
     rollout = RolloutBuffer()
+
+    # Init translator (needs replay/rollout refs)
+    if not baseline_mode:
+        translator = ActionTranslator(
+            ctrl=ctrl, obs_proc=obs_proc, reward_signal=reward_signal,
+            replay=replay, rollout=rollout, monitor=monitor,
+            strategy_vec=None, sct=sct,
+        )
 
     # Experiment-specific checkpoints
     exp_checkpoint_dir = CHECKPOINT_DIR / experiment_tag
@@ -554,8 +589,9 @@ def main():
     sct = mss.mss()
     monitor = bbox
 
-    # --- Vision-language advisor ---
+    # --- Vision-language advisor + translator ---
     advisor = None
+    translator = None
     if not baseline_mode:
         advisor = Advisor(knowledge, sct, monitor, device)
         advisor.start()
@@ -633,17 +669,42 @@ def main():
             obs_proc.push(frame)
             obs = obs_proc.get()  # (4, 128, 128)
 
-            # 1.5 Check for advisor update (contextual advice from Claude)
+            # 1.5 Check for advisor update + run demonstration
             if advisor is not None:
                 advisor_vec = advisor.get_strategy()
                 if advisor_vec is not None:
                     strategy_vec = advisor_vec
                     strategy_t = torch.from_numpy(strategy_vec).unsqueeze(0).to(device)
 
-            # 2. Get action from network (CNN + strategy)
+                # Check if new advice arrived — trigger demonstration
+                new_advice = advisor.consume_advice()
+                if new_advice is not None and translator is not None:
+                    translator.strategy_vec = strategy_vec
+                    demo_steps, demo_reward = translator.translate_and_execute(
+                        new_advice, sct)
+                    global_step += demo_steps
+                    episode_reward += demo_reward
+
+            # 1.7 Process audio
+            audio_vec = None
+            audio_t = None
+            audio_reward = 0.0
+            if audio_proc is not None:
+                audio_features, audio_events = audio_proc.process(audio_capture)
+                audio_vec = audio_features
+                audio_t = torch.from_numpy(audio_features).unsqueeze(0).to(device)
+                audio_reward = audio_events["reward_adjustment"]
+                if audio_events["mining"]:
+                    pass  # Reward added via adjustment, no log spam
+                if audio_events["attack_warning"]:
+                    print(f"  [AUDIO] Attack warning detected! ({audio_reward:+.2f})")
+                if audio_events["entity_placed"]:
+                    print(f"  [AUDIO] Entity placement sound (+0.1)")
+
+            # 2. Get action from network (CNN + strategy + audio)
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-                action, log_prob, value = net.get_action(obs_t, strategy=strategy_t)
+                action, log_prob, value = net.get_action(obs_t, strategy=strategy_t, audio=audio_t)
                 action_id = action.item()
                 log_prob_val = log_prob.item()
                 value_val = value.item()
@@ -660,6 +721,9 @@ def main():
                 r, _ = reward_signal.compute(skip_frame)
                 total_reward += r
             action_counts[action_id] += 1
+
+            # 3.4 Audio reward
+            total_reward += audio_reward
 
             # 3.5 Curriculum action shaping
             if action_id == 17:  # No-op penalty
@@ -679,7 +743,8 @@ def main():
 
             # 5. Store experience (accumulated reward across skipped frames)
             rollout.push(obs, action_id, log_prob_val, total_reward, value_val, done,
-                         strategy=strategy_vec if knowledge else None)
+                         strategy=strategy_vec if knowledge else None,
+                         audio=audio_vec)
             replay.push(obs, action_id, total_reward, next_obs, done)
 
             episode_reward += total_reward
@@ -740,12 +805,24 @@ def main():
                     last_refresh_step = global_step
                     print(f"  Knowledge refreshed. Resuming training.\n")
 
-            # 7. Checkpoint
+            # 7. Checkpoint + attention map
             if global_step % CHECKPOINT_INTERVAL == 0 and global_step > 0:
                 save_checkpoint(
                     net, optimizer, global_step, cumulative_reward + episode_reward,
                     exp_checkpoint_dir / f"step_{global_step:07d}.pt",
                 )
+                # Save attention heatmap
+                attn_map = net.get_attention_map()
+                if attn_map is not None:
+                    attn_dir = Path("attention_maps")
+                    attn_dir.mkdir(exist_ok=True)
+                    # Normalize and save as heatmap
+                    attn_vis = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
+                    attn_vis = (attn_vis * 255).astype(np.uint8)
+                    attn_vis = cv2.resize(attn_vis, (256, 256), interpolation=cv2.INTER_NEAREST)
+                    attn_colored = cv2.applyColorMap(attn_vis, cv2.COLORMAP_JET)
+                    cv2.imwrite(str(attn_dir / f"attn_step_{global_step:07d}.png"), attn_colored)
+                    print(f"  Attention map saved: {attn_dir / f'attn_step_{global_step:07d}.png'}")
 
             # 8. Pace control
             elapsed = time.time() - step_start
