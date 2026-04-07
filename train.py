@@ -27,6 +27,7 @@ from reward import RewardSignal
 from memory import ReplayBuffer
 from network import ActorCritic, NUM_ACTIONS, ACTION_NAMES
 from knowledge import KnowledgeBase, EMBEDDING_DIM
+from advisor import Advisor
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +554,12 @@ def main():
     sct = mss.mss()
     monitor = bbox
 
+    # --- Vision-language advisor ---
+    advisor = None
+    if not baseline_mode:
+        advisor = Advisor(knowledge, sct, monitor, device)
+        advisor.start()
+
     # --- Timing ---
     step_interval = 1.0 / DECISIONS_PER_SEC
 
@@ -625,6 +632,13 @@ def main():
             frame = np.array(img)[:, :, :3]
             obs_proc.push(frame)
             obs = obs_proc.get()  # (4, 128, 128)
+
+            # 1.5 Check for advisor update (contextual advice from Claude)
+            if advisor is not None:
+                advisor_vec = advisor.get_strategy()
+                if advisor_vec is not None:
+                    strategy_vec = advisor_vec
+                    strategy_t = torch.from_numpy(strategy_vec).unsqueeze(0).to(device)
 
             # 2. Get action from network (CNN + strategy)
             with torch.no_grad():
@@ -758,6 +772,8 @@ def main():
             print(f"  Last p_loss:    {last_loss_info['policy_loss']:.4f}")
             print(f"  Last entropy:   {last_loss_info['entropy']:.3f}")
         print("\nDone.")
+        if advisor is not None:
+            advisor.stop()
         sct.close()
 
 
