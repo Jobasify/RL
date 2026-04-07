@@ -1,8 +1,10 @@
 # Capture outputs
 captures/
+checkpoints/
 *.wav
 *.png
 *.npz
+*.pt
 
 # Python
 __pycache__/
