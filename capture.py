@@ -1,6 +1,6 @@
 """
 Factorio screen + audio capture pipeline.
-Captures frames via mss, displays them with OpenCV, and records audio via PyAudio.
+Captures frames via mss, displays them with OpenCV, and records audio via soundcard (WASAPI loopback).
 Press 'q' to stop. Press 's' to save a 3-second snapshot (frames + audio).
 """
 
@@ -15,7 +15,7 @@ from pathlib import Path
 import cv2
 import mss
 import numpy as np
-import pyaudio
+import soundcard as sc
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +34,8 @@ def find_factorio_window():
         if hwnd:
             break
 
-    # Fallback: enumerate all windows looking for one containing "factorio"
+    # Fallback: enumerate all windows looking for the Factorio game window
+    # Match "Factorio X.Y.Z" pattern to avoid matching other windows (e.g. browser tabs)
     if not hwnd:
         found = []
 
@@ -43,8 +44,11 @@ def find_factorio_window():
             if length > 0:
                 buf = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(h, buf, length + 1)
-                if "factorio" in buf.value.lower():
-                    found.append((h, buf.value))
+                title = buf.value
+                # Match windows where title starts with "Factorio" (the game window)
+                # This avoids matching browser tabs or editors that mention Factorio
+                if title.lower().startswith("factorio"):
+                    found.append((h, title.encode("ascii", "replace").decode()))
             return True
 
         WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.POINTER(ctypes.c_int))
@@ -68,61 +72,24 @@ def find_factorio_window():
 # ---------------------------------------------------------------------------
 
 class AudioCapture:
-    """Captures system audio via WASAPI loopback (Windows stereo mix)."""
+    """Captures system audio via WASAPI loopback using soundcard library."""
 
-    def __init__(self, rate=44100, channels=2, chunk=1024):
+    def __init__(self, rate=48000, channels=2):
         self.rate = rate
         self.channels = channels
-        self.chunk = chunk
-        self.frames = []
         self.recording = False
-        self.saving = False
-        self._pa = None
-        self._stream = None
         self._thread = None
         self._lock = threading.Lock()
-
-    def _find_loopback_device(self, pa):
-        """Find a WASAPI loopback or stereo mix device."""
-        device_count = pa.get_device_count()
-        candidates = []
-        for i in range(device_count):
-            info = pa.get_device_info_by_index(i)
-            name = info.get("name", "").lower()
-            max_input = info.get("maxInputChannels", 0)
-            if max_input > 0 and any(kw in name for kw in ["stereo mix", "loopback", "what u hear", "wave out"]):
-                candidates.append((i, info))
-        if candidates:
-            return candidates[0]
-        # Fallback: just use default input
-        default_idx = pa.get_default_input_device_info()["index"]
-        return default_idx, pa.get_device_info_by_index(default_idx)
+        self._buffer = []  # list of numpy arrays
+        self._speaker = None
 
     def start(self):
-        self._pa = pyaudio.PyAudio()
-        idx, info = self._find_loopback_device(self._pa)
-        device_index = idx if isinstance(idx, int) else idx
-        print(f"Audio device: {info['name']} (index={device_index})")
-
-        actual_rate = int(info.get("defaultSampleRate", self.rate))
-        actual_channels = min(self.channels, int(info.get("maxInputChannels", self.channels)))
-        self.rate = actual_rate
-        self.channels = actual_channels
-
         try:
-            self._stream = self._pa.open(
-                format=pyaudio.paInt16,
-                channels=self.channels,
-                rate=self.rate,
-                input=True,
-                input_device_index=device_index,
-                frames_per_buffer=self.chunk,
-            )
+            self._speaker = sc.default_speaker()
+            print(f"Audio loopback: {self._speaker.name} @ {self.rate}Hz")
         except Exception as e:
-            print(f"WARNING: Could not open audio device: {e}")
+            print(f"WARNING: Could not find audio device: {e}")
             print("Audio capture disabled. Screen capture will still work.")
-            self._pa.terminate()
-            self._pa = None
             return False
 
         self.recording = True
@@ -131,48 +98,50 @@ class AudioCapture:
         return True
 
     def _record_loop(self):
-        while self.recording:
-            try:
-                data = self._stream.read(self.chunk, exception_on_overflow=False)
-                with self._lock:
-                    self.frames.append(data)
-                    # Keep only last 10 seconds in memory
-                    max_frames = (self.rate // self.chunk) * 10
-                    if len(self.frames) > max_frames:
-                        self.frames = self.frames[-max_frames:]
-            except Exception:
-                break
+        chunk_frames = self.rate // 10  # 100ms chunks
+        try:
+            mic = sc.get_microphone(id=str(self._speaker.id), include_loopback=True)
+            with mic.recorder(samplerate=self.rate, channels=self.channels) as recorder:
+                while self.recording:
+                    data = recorder.record(numframes=chunk_frames)
+                    with self._lock:
+                        self._buffer.append(data)
+                        # Keep only last 10 seconds
+                        max_chunks = 10 * 10  # 10 seconds * 10 chunks/sec
+                        if len(self._buffer) > max_chunks:
+                            self._buffer = self._buffer[-max_chunks:]
+        except Exception as e:
+            print(f"Audio recording error: {e}")
 
     def save_snapshot(self, filepath, seconds=3):
         """Save the last N seconds of audio to a WAV file."""
-        if not self._pa:
+        if not self._speaker:
             print("Audio not available, skipping save.")
             return
         with self._lock:
-            frames_needed = (self.rate // self.chunk) * seconds
-            snapshot = list(self.frames[-frames_needed:])
+            chunks_needed = seconds * 10  # 10 chunks per second
+            snapshot = list(self._buffer[-chunks_needed:])
 
         if not snapshot:
             print("No audio data captured yet.")
             return
 
+        audio_data = np.concatenate(snapshot, axis=0)
+        # Convert float32 [-1, 1] to int16
+        audio_int16 = (audio_data * 32767).clip(-32768, 32767).astype(np.int16)
+
         wf = wave.open(str(filepath), "wb")
         wf.setnchannels(self.channels)
-        wf.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
+        wf.setsampwidth(2)  # 16-bit
         wf.setframerate(self.rate)
-        wf.writeframes(b"".join(snapshot))
+        wf.writeframes(audio_int16.tobytes())
         wf.close()
-        print(f"Saved {len(snapshot)} audio chunks ({seconds}s) to {filepath}")
+        print(f"Saved {audio_data.shape[0] / self.rate:.1f}s audio to {filepath}")
 
     def stop(self):
         self.recording = False
         if self._thread:
             self._thread.join(timeout=2)
-        if self._stream:
-            self._stream.stop_stream()
-            self._stream.close()
-        if self._pa:
-            self._pa.terminate()
 
 
 # ---------------------------------------------------------------------------
