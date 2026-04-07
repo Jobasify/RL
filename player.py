@@ -47,24 +47,27 @@ FADE_SCHEDULE = [
 SYSTEM_PROMPT = (
     "You are directly controlling Factorio through keyboard and mouse. "
     "The character is always at screen center (1280, 720 on a 2560x1440 screen). "
-    "You can see the current game state. Your goal is to launch a rocket.\n\n"
-    "IMPORTANT: You are called every 30 seconds. Each call should include a "
-    "COMPLETE action sequence — move AND mine/build/craft in one response. "
-    "Don't just move — always follow movement with an action like mining "
-    "(right_click_hold on a resource) or building. Every response must include "
-    "at least one right_click_hold or left_click, not just key presses.\n\n"
-    "Output exact input sequences to achieve your goal. Be precise about "
-    "directions, durations, and coordinates. You are the hands.\n\n"
+    "Your goal is to launch a rocket.\n\n"
+    "You are called every 30 seconds. Each call should include a COMPLETE action "
+    "sequence — move AND mine/build/craft in one response. Every response must "
+    "include at least one right_click_hold or left_click, not just key presses.\n\n"
+    "IMPORTANT: You have persistent memory. Your game state is provided with each "
+    "call. Do NOT repeat actions you have done enough of. Progress through the "
+    "tech tree: mine ore → craft stone furnace → smelt plates → craft drills → "
+    "automate mining → craft assemblers → research → expand → launch rocket.\n\n"
     "Return JSON only, no markdown:\n"
     '{\n'
-    '  "reasoning": "why you chose these inputs",\n'
+    '  "reasoning": "why — reference your inventory and current goal",\n'
     '  "inputs": [\n'
     '    {"type": "key", "key": "w", "duration": 0.5},\n'
-    '    {"type": "key", "key": "d", "duration": 0.3},\n'
-    '    {"type": "right_click_hold", "x": 1280, "y": 720, "duration": 3.0},\n'
-    '    {"type": "left_click", "x": 500, "y": 400},\n'
-    '    {"type": "key", "key": "e", "duration": 0.1}\n'
-    '  ]\n'
+    '    {"type": "right_click_hold", "x": 1280, "y": 720, "duration": 3.0}\n'
+    '  ],\n'
+    '  "state_update": {\n'
+    '    "inventory_changes": {"iron_ore": 5},\n'
+    '    "milestone_reached": "mined first iron" or null,\n'
+    '    "current_goal": "what to focus on now",\n'
+    '    "next_milestone": "next thing to achieve"\n'
+    '  }\n'
     '}\n\n'
     "Available input types:\n"
     '- {"type": "key", "key": "w/a/s/d/e/q/space/tab/escape/1-9", "duration": seconds}\n'
@@ -102,8 +105,71 @@ def get_claude_ratio(step):
     return ratio
 
 
+class GameState:
+    """Persistent game state that carries between Claude decisions."""
+
+    def __init__(self):
+        self.session_start = datetime.now().isoformat()
+        self.decisions_made = 0
+        self.inventory = {}
+        self.milestones_reached = []
+        self.current_goal = "mine iron ore and stone"
+        self.next_milestone = "craft stone furnace"
+        self.history = []  # Last 10 decisions
+
+    def update(self, state_update, reasoning):
+        """Apply Claude's state update."""
+        self.decisions_made += 1
+
+        # Update inventory
+        changes = state_update.get("inventory_changes", {})
+        for item, qty in changes.items():
+            self.inventory[item] = self.inventory.get(item, 0) + qty
+
+        # Milestone
+        milestone = state_update.get("milestone_reached")
+        if milestone and milestone != "null":
+            self.milestones_reached.append(milestone)
+            print(f"  [STATE] MILESTONE: {milestone}")
+            _log(f"MILESTONE: {milestone}")
+
+        # Goals
+        goal = state_update.get("current_goal")
+        if goal:
+            self.current_goal = goal
+        nxt = state_update.get("next_milestone")
+        if nxt:
+            self.next_milestone = nxt
+
+        # History (keep last 10)
+        self.history.append({
+            "decision": self.decisions_made,
+            "reasoning": reasoning[:100],
+            "goal": self.current_goal,
+        })
+        if len(self.history) > 10:
+            self.history.pop(0)
+
+    def to_prompt(self):
+        """Format state for Claude's prompt."""
+        inv_str = ", ".join(f"{k}: {v}" for k, v in self.inventory.items()) or "empty"
+        milestones_str = ", ".join(self.milestones_reached[-5:]) or "none yet"
+        history_str = "\n".join(
+            f"  #{h['decision']}: {h['reasoning']}" for h in self.history[-5:]
+        ) or "  (first action)"
+
+        return (
+            f"SESSION STATE (decision #{self.decisions_made + 1}):\n"
+            f"  Inventory (estimated): {inv_str}\n"
+            f"  Milestones: {milestones_str}\n"
+            f"  Current goal: {self.current_goal}\n"
+            f"  Next milestone: {self.next_milestone}\n"
+            f"  Recent history:\n{history_str}"
+        )
+
+
 class ClaudePlayer:
-    """Claude as the direct Factorio controller. No interpretation layer."""
+    """Claude as the direct Factorio controller with persistent game state."""
 
     def __init__(self, ctrl, monitor):
         self.ctrl = ctrl
@@ -115,6 +181,7 @@ class ClaudePlayer:
         self._total_spend = 0.0
         self._budget_exceeded = False
         self._last_reasoning = ""
+        self.state = GameState()
 
     def print_cost_estimate(self):
         calls_per_hour = min(3600 / DECISION_INTERVAL, MAX_CALLS_PER_HOUR)
@@ -191,10 +258,8 @@ class ClaudePlayer:
                             },
                         },
                         {"type": "text", "text": (
-                            f"What inputs should you execute right now? "
-                            f"Your last action was: {self._last_reasoning[:150]}"
-                            if self._last_reasoning else
-                            "What inputs should you execute right now? This is your first action."
+                            f"{self.state.to_prompt()}\n\n"
+                            f"What inputs should you execute right now?"
                         )},
                     ],
                 }],
@@ -220,6 +285,11 @@ class ClaudePlayer:
             self._record_call()
             self.total_decisions += 1
             self._last_reasoning = result.get("reasoning", "")
+
+            # Apply state update
+            state_update = result.get("state_update", {})
+            self.state.update(state_update, self._last_reasoning)
+
             return result
         except json.JSONDecodeError as e:
             _log(f"JSON PARSE ERROR: {e} | raw: {text[:200] if 'text' in dir() else 'no response'}")
@@ -359,6 +429,11 @@ def main():
         pass
 
     print(f"\nClaude made {player.total_decisions} decisions. Spent: ${player.spend:.2f}")
+    print(f"\nFinal game state:")
+    print(f"  Inventory: {player.state.inventory}")
+    print(f"  Milestones: {player.state.milestones_reached}")
+    print(f"  Current goal: {player.state.current_goal}")
+    print(f"  Next milestone: {player.state.next_milestone}")
     print("Done.")
 
 
