@@ -169,7 +169,113 @@ def run_test(ctrl):
     print("\nTest sequence complete.")
 
 
+def test_mining():
+    """Full precision mining pipeline test.
+    Exercises: screen capture -> locate_target -> verify_on_ore ->
+    nudge_to_ore -> right click hold -> mining confirmation."""
+    import mss
+    import numpy as np
+    from capture import find_factorio_window
+    from reward import RewardSignal
+
+    print("=== Full Mining Pipeline Test ===\n")
+    ctrl = FactorioController()
+    bbox = find_factorio_window()
+
+    print("Starting in 3 seconds — have Factorio open with ore visible!")
+    for i in range(3, 0, -1):
+        print(f"  {i}...")
+        time.sleep(1)
+
+    # Step 1: Capture screen
+    print("\n[1] Capturing screen...")
+    with mss.mss() as sct:
+        img = sct.grab(bbox)
+    frame = np.array(img)[:, :, :3]
+    print(f"  Frame: {frame.shape}")
+
+    # Step 2: Locate ore via colour detection
+    print("\n[2] Running locate_target() for iron_ore...")
+    from translator import ActionTranslator
+    translator = ActionTranslator(
+        ctrl=ctrl, obs_proc=None, reward_signal=None,
+        replay=None, rollout=None, monitor=bbox,
+        strategy_vec=None, sct=None,
+    )
+
+    # Try iron ore first, then copper
+    ore_type = "iron_ore"
+    target_pos = translator.locate_target(frame, ore_type, direction="none")
+    if not target_pos:
+        ore_type = "copper_ore"
+        print("  No iron ore found, trying copper_ore...")
+        target_pos = translator.locate_target(frame, ore_type, direction="none")
+    if not target_pos:
+        print("  No ore found by colour detection. Aborting.")
+        return
+
+    tx, ty = target_pos
+    cx, cy = ctrl.width // 2, ctrl.height // 2
+    dist = ((tx - cx) ** 2 + (ty - cy) ** 2) ** 0.5
+    print(f"  Ore density peak at ({tx}, {ty}), {dist:.0f}px from center")
+
+    # Step 3: Walk toward ore if far from center
+    print(f"\n[3] Walking toward ore...")
+    tx, ty = translator.walk_toward((tx, ty), frame, ore_type, None)
+    print(f"  Position after walk: ({tx}, {ty})")
+
+    # Step 4: Move mouse and verify on ore
+    print(f"\n[4] Moving mouse to ({tx}, {ty}), verifying with Claude...")
+    ctrl.move(tx, ty)
+    time.sleep(0.15)
+    on_ore = translator.verify_on_ore(tx, ty)
+    print(f"  Result: {'ON ORE' if on_ore else 'NOT ON ORE'}")
+
+    # Step 5: Nudge if needed
+    if not on_ore:
+        print("\n[5] Running nudge_to_ore() — trying ±10px offsets...")
+        tx, ty = translator.nudge_to_ore(tx, ty)
+        print(f"  Final position: ({tx}, {ty})")
+    else:
+        print("\n[5] Already on ore, no nudge needed")
+
+    # Step 6: Right click hold
+    print(f"\n[6] Right click holding at ({tx}, {ty}) for 5 seconds...")
+    ctrl.move(tx, ty)
+    time.sleep(0.1)
+    mouse.press(Button.right)
+    time.sleep(5.0)
+    mouse.release(Button.right)
+    print("  Released")
+
+    # Step 7: Check mining confirmation (two-frame check)
+    print("\n[7] Checking for genuine mining confirmation...")
+    reward_signal = RewardSignal(bbox["width"], bbox["height"])
+
+    # Capture two frames with a small delay
+    with mss.mss() as sct:
+        img1 = sct.grab(bbox)
+        frame1 = np.array(img1)[:, :, :3]
+        _, details1 = reward_signal.compute(frame1)
+        time.sleep(0.15)
+        img2 = sct.grab(bbox)
+        frame2 = np.array(img2)[:, :, :3]
+        _, details2 = reward_signal.compute(frame2)
+
+    gained = details2.get("inventory_gain", False)
+    print(f"  Frame 1 computed")
+    print(f"  Frame 2 computed")
+    print(f"  Inventory gain detected: {gained}")
+
+    print("\n=== Test Complete ===")
+
+
 def main():
+    import sys
+    if "--mine" in sys.argv:
+        test_mining()
+        return
+
     print("=== Factorio Controller Test ===\n")
     ctrl = FactorioController()
 

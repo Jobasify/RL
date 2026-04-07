@@ -175,7 +175,7 @@ class ActionTranslator:
     # ------------------------------------------------------------------
 
     def locate_target(self, frame_bgr, target, direction="none"):
-        """Find target on screen using colour detection + direction bias.
+        """Find the densest ore pixel within a direction-biased search.
         Returns (x, y) in window coordinates or None."""
         if target == "none" or target not in TARGET_COLOURS:
             return None
@@ -184,37 +184,186 @@ class ActionTranslator:
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, colours["lower"], colours["upper"])
 
-        # Apply direction bias — weight pixels in the hinted quadrant
+        # Apply direction bias
         h, w = mask.shape
         cx, cy = w // 2, h // 2
         bx, by = DIRECTION_BIAS.get(direction, (0, 0))
-
-        # Create weight map biased toward direction
-        ys, xs = np.mgrid[0:h, 0:w]
         bias_x = cx + int(bx * w)
         bias_y = cy + int(by * h)
+        ys, xs = np.mgrid[0:h, 0:w]
         dist = np.sqrt((xs - bias_x) ** 2 + (ys - bias_y) ** 2).astype(np.float32)
         max_dist = np.sqrt(w ** 2 + h ** 2)
-        weight = 1.0 - (dist / max_dist) * 0.5  # Closer to bias = higher weight
+        weight = 1.0 - (dist / max_dist) * 0.5
 
         weighted_mask = mask.astype(np.float32) * weight
 
-        # Find the region with highest weighted density
-        # Use a coarse grid search
+        # Coarse search: find best 64x64 cell
         best_score = 0
-        best_pos = None
+        best_cx, best_cy = cx, cy
         cell = 64
         for y in range(0, h - cell, cell // 2):
             for x in range(0, w - cell, cell // 2):
                 score = weighted_mask[y:y + cell, x:x + cell].sum()
                 if score > best_score:
                     best_score = score
-                    best_pos = (x + cell // 2, y + cell // 2)
+                    best_cx = x + cell // 2
+                    best_cy = y + cell // 2
 
-        if best_score < 100:  # Minimum threshold
+        if best_score < 100:
             return None
 
-        return best_pos
+        # Fine search: find densest point within 50px radius of coarse match
+        r = 50
+        x1 = max(0, best_cx - r)
+        y1 = max(0, best_cy - r)
+        x2 = min(w, best_cx + r)
+        y2 = min(h, best_cy + r)
+        patch = mask[y1:y2, x1:x2]
+
+        if patch.sum() == 0:
+            return (best_cx, best_cy)
+
+        # Gaussian blur to find density peak
+        blurred = cv2.GaussianBlur(patch.astype(np.float32), (21, 21), 0)
+        _, _, _, max_loc = cv2.minMaxLoc(blurred)
+        fine_x = x1 + max_loc[0]
+        fine_y = y1 + max_loc[1]
+
+        _log(f"Target located: coarse=({best_cx},{best_cy}) -> fine=({fine_x},{fine_y})")
+        return (fine_x, fine_y)
+
+    def walk_toward(self, target_pos, frame_bgr, target, sct):
+        """Walk the character to ore using fixed-duration walk based on pixel offset.
+        Character is at screen center. Walk time = pixel distance / speed constant.
+        Then re-scan once to find ore at the new position."""
+        cx = self.ctrl.width // 2
+        cy = self.ctrl.height // 2
+        tx, ty = target_pos
+        proximity = 300  # Mining range is generous at 1440p
+        px_per_second = 400
+
+        dx = tx - cx
+        dy = ty - cy
+        dist = (dx ** 2 + dy ** 2) ** 0.5
+
+        if dist <= proximity:
+            print(f"  [WALK] Ore within {dist:.0f}px of center — in mining range, no walk")
+            return (tx, ty)
+
+        print(f"  [WALK] Ore at ({tx},{ty}), {dist:.0f}px from center")
+        print(f"  [WALK] Offset: {dx:+.0f}px horizontal, {dy:+.0f}px vertical")
+
+        # Walk horizontal component
+        if abs(dx) > 100:
+            key = "d" if dx > 0 else "a"
+            walk_time = abs(dx) / px_per_second
+            print(f"  [WALK] Walking {'east' if dx > 0 else 'west'} for {walk_time:.1f}s")
+            self.ctrl.hold_key(key, duration=walk_time)
+            time.sleep(0.1)
+
+        # Walk vertical component
+        if abs(dy) > 100:
+            key = "s" if dy > 0 else "w"
+            walk_time = abs(dy) / px_per_second
+            print(f"  [WALK] Walking {'south' if dy > 0 else 'north'} for {walk_time:.1f}s")
+            self.ctrl.hold_key(key, duration=walk_time)
+            time.sleep(0.1)
+
+        # Re-scan for ore at new position
+        print(f"  [WALK] Arrived — re-scanning for {target}...")
+        import mss as mss_mod
+        with mss_mod.mss() as cap_sct:
+            img = cap_sct.grab(self.monitor)
+        frame = np.array(img)[:, :, :3]
+        new_pos = self.locate_target(frame, target)
+
+        if new_pos:
+            ntx, nty = new_pos
+            new_dist = ((ntx - cx) ** 2 + (nty - cy) ** 2) ** 0.5
+            # If walk made things worse, use original — character is probably already in range
+            if new_dist > dist:
+                print(f"  [WALK] Ore moved further ({new_dist:.0f}px > {dist:.0f}px) — "
+                      f"using original position, likely in range")
+                return (tx, ty)
+            print(f"  [WALK] Ore now at ({ntx},{nty}), {new_dist:.0f}px from center")
+            return (ntx, nty)
+        else:
+            print(f"  [WALK] Ore not found in re-scan — using screen center")
+            return (cx, cy)
+
+    def verify_on_ore(self, tx, ty):
+        """Ask Claude if cursor is on an ore tile. Returns True/False."""
+        if not self._init_client():
+            return True  # Can't verify, assume yes
+
+        try:
+            import mss as mss_mod
+            with mss_mod.mss() as cap_sct:
+                img = cap_sct.grab(self.monitor)
+            frame = np.array(img)[:, :, :3]
+
+            # Crop 100x100 around cursor
+            h, w = frame.shape[:2]
+            x1 = max(0, tx - 50)
+            y1 = max(0, ty - 50)
+            x2 = min(w, tx + 50)
+            y2 = min(h, ty + 50)
+            crop = frame[y1:y2, x1:x2]
+
+            _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            image_b64 = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+
+            response = self._client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=50,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": ("Is the cursor sitting directly on a minable ore tile "
+                                     "or on empty ground? Return JSON only: "
+                                     '{"on_ore": true} or {"on_ore": false}'),
+                        },
+                    ],
+                }],
+            )
+            text = response.content[0].text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            result = json.loads(text)
+            on_ore = result.get("on_ore", False)
+            print(f"  [TARGET] Ore check at ({tx},{ty}): {'ON ORE' if on_ore else 'MISS'}")
+            _log(f"ORE CHECK ({tx},{ty}): on_ore={on_ore}")
+            return on_ore
+        except Exception as e:
+            _log(f"Ore verify failed: {e}")
+            return True  # Assume yes on failure
+
+    def nudge_to_ore(self, tx, ty):
+        """Try nudging cursor ±10px in each direction until on ore.
+        Returns corrected (x, y) or original if all fail."""
+        nudges = [(0, 0), (10, 0), (-10, 0), (0, 10), (0, -10),
+                  (10, 10), (-10, -10), (10, -10), (-10, 10)]
+        for dx, dy in nudges:
+            nx, ny = tx + dx, ty + dy
+            self.ctrl.move(nx, ny)
+            time.sleep(0.15)
+            if self.verify_on_ore(nx, ny):
+                if dx != 0 or dy != 0:
+                    print(f"  [TARGET] Nudged to ({nx},{ny}) — on ore")
+                    _log(f"NUDGE SUCCESS: ({tx},{ty}) -> ({nx},{ny})")
+                return nx, ny
+        print(f"  [TARGET] All nudges failed, using original ({tx},{ty})")
+        return tx, ty
 
     # ------------------------------------------------------------------
     # Step 2.5: Hover and read tooltip
@@ -504,6 +653,17 @@ class ActionTranslator:
             tx, ty = target_pos
             print(f"  [DEMO] Target '{target}' found at ({tx}, {ty})")
             _log(f"Target located: ({tx}, {ty})")
+
+            # Walk to ore if too far from character (screen center)
+            if intent_name == "mine":
+                target_pos = self.walk_toward(target_pos, frame, target, sct)
+                tx, ty = target_pos
+
+                # Precision targeting: verify cursor is on ore, nudge if not
+                self.ctrl.move(tx, ty)
+                time.sleep(0.15)
+                tx, ty = self.nudge_to_ore(tx, ty)
+                target_pos = (tx, ty)
 
             # Hover and read tooltip before committing
             tooltip_info, should_proceed = self.hover_and_read(target_pos, sct)

@@ -82,9 +82,11 @@ class InventoryDiffTracker:
         self.h = int(window_h * 0.04)
         self.prev_snapshot = None
         self.gained = False
+        self._pending = False  # First frame triggered, awaiting confirmation
 
     def check(self, frame_bgr):
-        """Compare hotbar snapshot. Returns bonus reward if items gained."""
+        """Compare hotbar snapshot with two-frame confirmation.
+        Returns bonus reward only if two consecutive frames show the gain."""
         roi = frame_bgr[self.y:self.y + self.h, self.x:self.x + self.w]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
@@ -102,11 +104,24 @@ class InventoryDiffTracker:
 
         self.prev_snapshot = gray.copy()
 
-        # Significant hotbar change with new bright pixels = item gained
-        if change > 2.0 and new_bright > 10:
+        triggered = change > 2.0 and new_bright > 10
+
+        if triggered and self._pending:
+            # Two consecutive frames confirm the gain
+            self._pending = False
             self.gained = True
+            print(f"  [REWARD] GENUINE MINING — confirmed across 2 frames "
+                  f"(change={change:.1f}, bright={new_bright})")
             return self.MINING_BONUS
+        elif triggered:
+            # First trigger — wait for confirmation
+            self._pending = True
+            self.gained = False
+            return 0.0
         else:
+            if self._pending:
+                print(f"  [REWARD] POSSIBLE FALSE POSITIVE — single frame blip, ignored")
+            self._pending = False
             self.gained = False
             return 0.0
 

@@ -1,12 +1,9 @@
 """
-Claude as the primary Factorio player.
-CNN as the student observer learning from expert demonstrations.
+Claude as the direct Factorio player.
+No interpretation layer — Claude outputs exact key/mouse sequences,
+control.py executes them literally.
 
-Every 5 seconds Claude sees the screen, reasons about the game state,
-and decides exactly one action. The CNN watches at 5x reward weight
-and gradually learns to replicate Claude's decisions.
-
-Over time Claude fades out and the CNN takes over.
+CNN observes at 5x reward weight and learns to replicate.
 """
 
 import base64
@@ -27,40 +24,65 @@ from control import FactorioController, mouse, keyboard
 PLAYER_LOG = Path("logs/player.log")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 EXPERT_REWARD_MULTIPLIER = 5.0
-DECISION_INTERVAL = 5.0  # Seconds between Claude decisions
+DECISION_INTERVAL = 30.0
+
+# --- API cost controls ---
+MAX_CALLS_PER_HOUR = 60
+HARD_SPEND_LIMIT = 5.00
+EST_INPUT_TOKENS_PER_CALL = 1500
+EST_OUTPUT_TOKENS_PER_CALL = 200
+COST_PER_INPUT_TOKEN = 3.00 / 1_000_000
+COST_PER_OUTPUT_TOKEN = 15.00 / 1_000_000
+EST_COST_PER_CALL = (EST_INPUT_TOKENS_PER_CALL * COST_PER_INPUT_TOKEN +
+                     EST_OUTPUT_TOKENS_PER_CALL * COST_PER_OUTPUT_TOKEN)
 
 # Fade schedule: (step_threshold, claude_pct)
 FADE_SCHEDULE = [
-    (0,     1.00),   # 0-10k: Claude 100%
-    (10000, 0.70),   # 10k-30k: Claude 70%
-    (30000, 0.40),   # 30k-60k: Claude 40%
-    (60000, 0.10),   # 60k+: Claude 10%
+    (0,     1.00),
+    (10000, 0.70),
+    (30000, 0.40),
+    (60000, 0.10),
 ]
 
 SYSTEM_PROMPT = (
-    "You are playing Factorio with the goal of launching a rocket. "
-    "You have full knowledge of the game. Look at this screenshot and decide "
-    "exactly one action to take right now. Consider your current situation, "
-    "what you have, what you need, and what the most logical next step toward "
-    "the rocket is.\n\n"
+    "You are directly controlling Factorio through keyboard and mouse. "
+    "The character is always at screen center (1280, 720 on a 2560x1440 screen). "
+    "You can see the current game state. Your goal is to launch a rocket.\n\n"
+    "IMPORTANT: You are called every 30 seconds. Each call should include a "
+    "COMPLETE action sequence — move AND mine/build/craft in one response. "
+    "Don't just move — always follow movement with an action like mining "
+    "(right_click_hold on a resource) or building. Every response must include "
+    "at least one right_click_hold or left_click, not just key presses.\n\n"
+    "Output exact input sequences to achieve your goal. Be precise about "
+    "directions, durations, and coordinates. You are the hands.\n\n"
     "Return JSON only, no markdown:\n"
-    '{"reason": "why you chose this", '
-    '"action_type": "move/mine/build/craft/open_menu/close_menu/research", '
-    '"direction": "north/south/east/west/none", '
-    '"target": "what to interact with or none", '
-    '"key": "specific key to press or none", '
-    '"mouse_action": "left_click/right_click_hold/none", '
-    '"duration": 3}'
+    '{\n'
+    '  "reasoning": "why you chose these inputs",\n'
+    '  "inputs": [\n'
+    '    {"type": "key", "key": "w", "duration": 0.5},\n'
+    '    {"type": "key", "key": "d", "duration": 0.3},\n'
+    '    {"type": "right_click_hold", "x": 1280, "y": 720, "duration": 3.0},\n'
+    '    {"type": "left_click", "x": 500, "y": 400},\n'
+    '    {"type": "key", "key": "e", "duration": 0.1}\n'
+    '  ]\n'
+    '}\n\n'
+    "Available input types:\n"
+    '- {"type": "key", "key": "w/a/s/d/e/q/space/tab/escape/1-9", "duration": seconds}\n'
+    '- {"type": "left_click", "x": pixel_x, "y": pixel_y}\n'
+    '- {"type": "right_click", "x": pixel_x, "y": pixel_y}\n'
+    '- {"type": "right_click_hold", "x": pixel_x, "y": pixel_y, "duration": seconds}\n'
+    '- {"type": "mouse_move", "x": pixel_x, "y": pixel_y}\n'
+    '- {"type": "wait", "duration": seconds}'
 )
 
-# Map action types to execution
-DIRECTION_KEYS = {
-    "north": "w", "south": "s", "east": "d", "west": "a",
+# Map key names to action IDs for CNN observation
+KEY_TO_ACTION_ID = {
+    "w": 0, "a": 1, "s": 2, "d": 3,
+    "e": 15, "q": 16, "space": 14,
 }
 
-KEY_MAP = {
-    "e": "e", "q": "q", "m": "m", "space": " ", "escape": Key.esc,
-    "tab": Key.tab, "t": "t", "r": "r", "c": "c", "z": "z",
+SPECIAL_KEYS = {
+    "escape": Key.esc, "tab": Key.tab, "shift": Key.shift,
 }
 
 
@@ -81,7 +103,7 @@ def get_claude_ratio(step):
 
 
 class ClaudePlayer:
-    """Claude as the expert Factorio player."""
+    """Claude as the direct Factorio controller. No interpretation layer."""
 
     def __init__(self, ctrl, monitor):
         self.ctrl = ctrl
@@ -89,18 +111,51 @@ class ClaudePlayer:
         self._client = None
         self.total_decisions = 0
         self.total_reward = 0.0
+        self._call_timestamps = []
+        self._total_spend = 0.0
+        self._budget_exceeded = False
+        self._last_reasoning = ""
+
+    def print_cost_estimate(self):
+        calls_per_hour = min(3600 / DECISION_INTERVAL, MAX_CALLS_PER_HOUR)
+        cost_per_hour = calls_per_hour * EST_COST_PER_CALL
+        hours_until_limit = HARD_SPEND_LIMIT / cost_per_hour if cost_per_hour > 0 else float("inf")
+        print(f"  API cost estimate:")
+        print(f"    Rate: 1 call / {DECISION_INTERVAL:.0f}s = {calls_per_hour:.0f} calls/hr "
+              f"(max {MAX_CALLS_PER_HOUR}/hr)")
+        print(f"    Cost: ~${EST_COST_PER_CALL:.4f}/call = ~${cost_per_hour:.2f}/hr")
+        print(f"    Limit: ${HARD_SPEND_LIMIT:.2f} = ~{hours_until_limit:.1f} hours of play")
+
+    def _check_rate_limit(self):
+        if self._budget_exceeded:
+            return False
+        now = time.time()
+        self._call_timestamps = [t for t in self._call_timestamps if now - t < 3600]
+        return len(self._call_timestamps) < MAX_CALLS_PER_HOUR
+
+    def _record_call(self):
+        self._call_timestamps.append(time.time())
+        self._total_spend += EST_COST_PER_CALL
+        if self._total_spend >= HARD_SPEND_LIMIT:
+            self._budget_exceeded = True
+            print(f"\n  *** BUDGET LIMIT: ${self._total_spend:.2f} — Claude disabled ***\n")
+            _log(f"BUDGET EXCEEDED: ${self._total_spend:.2f}")
+
+    @property
+    def spend(self):
+        return self._total_spend
+
+    @property
+    def is_available(self):
+        return not self._budget_exceeded and self._check_rate_limit()
 
     def _init_client(self):
         if self._client is None:
             import anthropic
             api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if api_key:
-                self._client = anthropic.Anthropic(api_key=api_key)
-            else:
-                self._client = anthropic.Anthropic()
+            self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     def _capture_b64(self):
-        """Capture screen as base64 JPEG."""
         with mss.mss() as sct:
             img = sct.grab(self.monitor)
         frame = np.array(img)[:, :, :3]
@@ -112,14 +167,17 @@ class ClaudePlayer:
         return base64.standard_b64encode(buf.tobytes()).decode("utf-8")
 
     def decide(self):
-        """Capture screen, ask Claude what to do. Returns action dict or None."""
+        """Capture screen, ask Claude for exact input sequence."""
+        if not self.is_available:
+            return None
+
         self._init_client()
         image_b64 = self._capture_b64()
 
         try:
             response = self._client.messages.create(
                 model=CLAUDE_MODEL,
-                max_tokens=400,
+                max_tokens=500,
                 system=SYSTEM_PROMPT,
                 messages=[{
                     "role": "user",
@@ -132,122 +190,105 @@ class ClaudePlayer:
                                 "data": image_b64,
                             },
                         },
-                        {"type": "text", "text": "What's your next move?"},
+                        {"type": "text", "text": (
+                            f"What inputs should you execute right now? "
+                            f"Your last action was: {self._last_reasoning[:150]}"
+                            if self._last_reasoning else
+                            "What inputs should you execute right now? This is your first action."
+                        )},
                     ],
                 }],
             )
             text = response.content[0].text.strip()
+            _log(f"RAW RESPONSE: {text[:500]}")
+            # Strip markdown fences
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            action = json.loads(text)
+            # Try to find JSON in the response if it's not pure JSON
+            if not text.startswith("{"):
+                # Look for first { and last }
+                start = text.find("{")
+                end = text.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    text = text[start:end + 1]
+                else:
+                    _log(f"NO JSON FOUND in response: {text[:200]}")
+                    print(f"  [CLAUDE] No JSON in response, skipping")
+                    self._record_call()
+                    return None
+            result = json.loads(text)
+            self._record_call()
             self.total_decisions += 1
-            return action
+            self._last_reasoning = result.get("reasoning", "")
+            return result
+        except json.JSONDecodeError as e:
+            _log(f"JSON PARSE ERROR: {e} | raw: {text[:200] if 'text' in dir() else 'no response'}")
+            print(f"  [CLAUDE] Bad JSON response, skipping")
+            self._record_call()
+            return None
         except Exception as e:
-            _log(f"DECIDE ERROR: {e}")
+            _log(f"DECIDE ERROR: {type(e).__name__}: {e}")
             return None
 
-    def execute(self, action):
-        """Execute Claude's decided action via control.py.
-        Returns list of (action_id, duration) for CNN observation."""
-        action_type = action.get("action_type", "move")
-        direction = action.get("direction", "none")
-        target = action.get("target", "none")
-        key = action.get("key", "none")
-        mouse_action = action.get("mouse_action", "none")
-        duration = min(action.get("duration", 3), 10)
-        reason = action.get("reason", "")
+    def execute(self, decision):
+        """Execute Claude's raw input sequence. Returns list of (action_id, duration)."""
+        reasoning = decision.get("reasoning", "")
+        inputs = decision.get("inputs", [])
 
-        print(f"  [CLAUDE] {action_type}: {reason[:80]}")
-        _log(f"ACTION: {json.dumps(action)}")
+        print(f"  [CLAUDE] {reasoning[:100]}")
+        _log(f"DECISION: {json.dumps(decision)}")
 
-        executed_actions = []
+        executed = []
 
-        # --- Movement ---
-        if action_type == "move" and direction in DIRECTION_KEYS:
-            k = DIRECTION_KEYS[direction]
-            self.ctrl.hold_key(k, duration=duration)
-            action_id = {"north": 0, "south": 2, "east": 3, "west": 1}[direction]
-            executed_actions.append((action_id, duration))
+        for inp in inputs:
+            inp_type = inp.get("type", "")
+            duration = min(inp.get("duration", 0.1), 10)
 
-        # --- Mining (right-click hold) ---
-        elif action_type == "mine":
-            # Move toward target direction first if specified
-            if direction in DIRECTION_KEYS:
-                k = DIRECTION_KEYS[direction]
-                self.ctrl.hold_key(k, duration=min(duration / 2, 2))
-                time.sleep(0.2)
+            if inp_type == "key":
+                key = inp.get("key", "")
+                if key in SPECIAL_KEYS:
+                    self.ctrl.press_key(SPECIAL_KEYS[key], duration=duration)
+                elif len(key) == 1:
+                    self.ctrl.hold_key(key, duration=duration)
+                action_id = KEY_TO_ACTION_ID.get(key, 17)
+                executed.append((action_id, duration))
 
-            cx, cy = self.ctrl.width // 2, self.ctrl.height // 2
-            self.ctrl.move(cx, cy)
-            time.sleep(0.1)
-            mouse.press(Button.right)
-            time.sleep(duration)
-            mouse.release(Button.right)
-            executed_actions.append((9, duration))  # right click
+            elif inp_type == "left_click":
+                x = int(inp.get("x", 1280))
+                y = int(inp.get("y", 720))
+                self.ctrl.click(x, y, "left")
+                executed.append((8, 0.1))
 
-        # --- Building ---
-        elif action_type == "build":
-            cx, cy = self.ctrl.width // 2, self.ctrl.height // 2
-            self.ctrl.click(cx, cy, "left")
-            time.sleep(0.3)
-            executed_actions.append((8, 0.3))
+            elif inp_type == "right_click":
+                x = int(inp.get("x", 1280))
+                y = int(inp.get("y", 720))
+                self.ctrl.click(x, y, "right")
+                executed.append((9, 0.1))
 
-        # --- Crafting ---
-        elif action_type == "craft":
-            self.ctrl.press_key("e", duration=0.1)
-            time.sleep(0.8)
-            # Click in crafting area (Claude should have specified where)
-            cx, cy = self.ctrl.width // 2, self.ctrl.height // 2
-            self.ctrl.click(cx, cy, "left")
-            time.sleep(0.5)
-            self.ctrl.press_key("e", duration=0.1)
-            executed_actions.append((15, 1.5))  # E key
+            elif inp_type == "right_click_hold":
+                x = int(inp.get("x", 1280))
+                y = int(inp.get("y", 720))
+                self.ctrl.move(x, y)
+                time.sleep(0.05)
+                mouse.press(Button.right)
+                time.sleep(duration)
+                mouse.release(Button.right)
+                print(f"  [CLAUDE] right_click_hold ({x},{y}) for {duration:.1f}s")
+                executed.append((9, duration))
 
-        # --- Open/close menu ---
-        elif action_type in ("open_menu", "close_menu"):
-            if key and key != "none" and key.lower() in KEY_MAP:
-                actual_key = KEY_MAP[key.lower()]
-                self.ctrl.press_key(actual_key, duration=0.1)
-                executed_actions.append((15, 0.1))
-            else:
-                self.ctrl.press_key("e", duration=0.1)
-                executed_actions.append((15, 0.1))
-            time.sleep(0.5)
+            elif inp_type == "mouse_move":
+                x = int(inp.get("x", 1280))
+                y = int(inp.get("y", 720))
+                self.ctrl.move(x, y)
+                executed.append((17, 0.05))
 
-        # --- Research ---
-        elif action_type == "research":
-            self.ctrl.press_key("t", duration=0.1)
-            time.sleep(1.0)
-            executed_actions.append((15, 1.0))
+            elif inp_type == "wait":
+                time.sleep(duration)
+                executed.append((17, duration))
 
-        # --- Key press fallback ---
-        elif key and key != "none":
-            if key.lower() in KEY_MAP:
-                actual_key = KEY_MAP[key.lower()]
-                self.ctrl.press_key(actual_key, duration=0.1)
-            time.sleep(0.3)
-            executed_actions.append((17, 0.3))
+            time.sleep(0.05)  # Small gap between inputs
 
-        # --- Mouse action fallback ---
-        elif mouse_action == "left_click":
-            cx, cy = self.ctrl.width // 2, self.ctrl.height // 2
-            self.ctrl.click(cx, cy, "left")
-            executed_actions.append((8, 0.1))
-
-        elif mouse_action == "right_click_hold":
-            cx, cy = self.ctrl.width // 2, self.ctrl.height // 2
-            self.ctrl.move(cx, cy)
-            mouse.press(Button.right)
-            time.sleep(duration)
-            mouse.release(Button.right)
-            executed_actions.append((9, duration))
-
-        else:
-            # No-op
-            time.sleep(0.5)
-            executed_actions.append((17, 0.5))
-
-        return executed_actions
+        return executed
 
 
 class RewardTracker:
@@ -276,7 +317,6 @@ class RewardTracker:
         return sum(recent) / len(recent) if recent else 0.0
 
     def convergence(self):
-        """How close CNN is to Claude's performance (0.0 to 1.0+)."""
         c = self.claude_avg()
         n = self.cnn_avg()
         if c <= 0:
@@ -285,10 +325,10 @@ class RewardTracker:
 
 
 def main():
-    """Standalone test — Claude plays Factorio."""
+    """Standalone test — Claude plays Factorio directly."""
     from capture import find_factorio_window
 
-    print("=== Claude Player Test ===\n")
+    print("=== Claude Direct Control Test ===\n")
 
     bbox = find_factorio_window()
     if not bbox:
@@ -297,8 +337,9 @@ def main():
 
     ctrl = FactorioController()
     player = ClaudePlayer(ctrl, bbox)
+    player.print_cost_estimate()
 
-    print(f"Starting in 3 seconds — switch to Factorio!")
+    print(f"\nStarting in 3 seconds — switch to Factorio!")
     for i in range(3, 0, -1):
         print(f"  {i}...")
         time.sleep(1)
@@ -306,22 +347,18 @@ def main():
     print("\nClaude is playing. Press Ctrl+C to stop.\n")
 
     try:
-        for step in range(20):
+        for step in range(10):
             print(f"\n--- Decision {step + 1} ---")
-            action = player.decide()
-            if action:
-                print(f"  Reason: {action.get('reason', '?')}")
-                print(f"  Action: {action.get('action_type')} "
-                      f"dir={action.get('direction')} "
-                      f"target={action.get('target')}")
-                player.execute(action)
+            decision = player.decide()
+            if decision:
+                player.execute(decision)
             else:
                 print("  (no decision)")
-            time.sleep(2)
+            time.sleep(5)
     except KeyboardInterrupt:
         pass
 
-    print(f"\nClaude made {player.total_decisions} decisions.")
+    print(f"\nClaude made {player.total_decisions} decisions. Spent: ${player.spend:.2f}")
     print("Done.")
 
 
