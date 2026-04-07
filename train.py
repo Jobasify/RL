@@ -2,10 +2,14 @@
 PPO training loop for the Factorio RL agent.
 Connects all components: capture, control, observation, reward, memory, network.
 Runs at 10 decisions/sec, PPO update every 512 steps.
+
+Safety: F12 = instant kill switch. Actions only execute when Factorio is focused.
 """
 
+import ctypes
 import os
 import time
+import threading
 import random
 from pathlib import Path
 
@@ -14,6 +18,7 @@ import mss
 import numpy as np
 import torch
 import torch.nn.functional as F
+from pynput import keyboard as kb
 
 from capture import find_factorio_window
 from control import FactorioController
@@ -21,6 +26,37 @@ from observation import ObservationProcessor
 from reward import RewardSignal
 from memory import ReplayBuffer
 from network import ActorCritic, NUM_ACTIONS, ACTION_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Safety: kill switch + focus guard
+# ---------------------------------------------------------------------------
+
+_kill_flag = threading.Event()
+
+
+def _start_kill_switch():
+    """Listen for F12 globally to stop training instantly."""
+    def on_press(key):
+        if key == kb.Key.f12:
+            print("\n\n*** F12 KILL SWITCH — stopping training ***")
+            _kill_flag.set()
+            return False  # Stop listener
+    listener = kb.Listener(on_press=on_press, daemon=True)
+    listener.start()
+    return listener
+
+
+def _is_factorio_focused():
+    """Check if the Factorio window is the current foreground window."""
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length == 0:
+        return False
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value.lower().startswith("factorio")
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +76,83 @@ LR = 3e-4                   # Learning rate
 DECISIONS_PER_SEC = 10      # Pace limiter
 CHECKPOINT_INTERVAL = 1000  # Save every N steps
 MOUSE_STEP = 80             # Pixels per mouse move action
+FRAME_SKIP = 4              # Repeat each action for N frames, observe the last
 
 CHECKPOINT_DIR = Path("checkpoints")
+
+# ---------------------------------------------------------------------------
+# Reward multipliers — tune these to shape what the agent cares about
+# Multiplied on top of the base weights in reward.py
+# Set to 0.0 to ignore a region entirely, >1.0 to amplify
+# ---------------------------------------------------------------------------
+REWARD_MULTIPLIERS = {
+    "Resources": 1.0,
+    "Minimap":   1.0,
+    "Hotbar":    1.0,
+    "World":     1.0,
+}
+
+
+# ---------------------------------------------------------------------------
+# Reward multiplier application
+# ---------------------------------------------------------------------------
+
+def apply_reward_multipliers(reward_signal):
+    """Apply REWARD_MULTIPLIERS config on top of base region weights."""
+    for region in reward_signal.regions:
+        mult = REWARD_MULTIPLIERS.get(region.name, 1.0)
+        region.weight *= mult
+    print("Reward multipliers applied:")
+    for r in reward_signal.regions:
+        mult = REWARD_MULTIPLIERS.get(r.name, 1.0)
+        print(f"  {r.name:12s} base_weight * {mult:.1f} = {r.weight:.1f}")
+
+
+# ---------------------------------------------------------------------------
+# Curriculum: start a fresh Factorio game via UI automation
+# ---------------------------------------------------------------------------
+
+def start_fresh_game(ctrl):
+    """Automate Factorio menus to start a new freeplay game.
+
+    Navigates: Main Menu -> Play -> New Game -> Generate -> Play.
+    Call this when Factorio is at the main menu. If already in-game,
+    this is a no-op (set CURRICULUM_NEW_GAME = False to skip).
+    """
+    from pynput.keyboard import Key
+
+    print("\n--- Curriculum: Starting fresh Factorio game ---")
+    cx, cy = ctrl.width // 2, ctrl.height // 2
+
+    # Press Escape first in case we're in-game — brings up menu
+    ctrl.press_key(Key.esc, duration=0.1)
+    time.sleep(1.0)
+
+    # Click "Quit to title" if in-game menu (bottom area)
+    ctrl.click(cx, int(ctrl.height * 0.72), "left")
+    time.sleep(0.5)
+    # Confirm quit if prompted
+    ctrl.click(cx, int(ctrl.height * 0.52), "left")
+    time.sleep(2.0)
+
+    # Now at main menu — click "Play" (center-ish)
+    ctrl.click(cx, int(ctrl.height * 0.35), "left")
+    time.sleep(1.0)
+
+    # Click "New Game"
+    ctrl.click(cx, int(ctrl.height * 0.30), "left")
+    time.sleep(1.0)
+
+    # Click "Play" to start with default settings
+    # The play button is typically bottom-right area
+    ctrl.click(int(ctrl.width * 0.85), int(ctrl.height * 0.92), "left")
+    time.sleep(1.0)
+
+    # If there's a generate/confirm step, click through it
+    ctrl.click(int(ctrl.width * 0.85), int(ctrl.height * 0.92), "left")
+    time.sleep(5.0)  # Wait for world generation
+
+    print("--- Fresh game started (or attempted) ---\n")
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +416,7 @@ def main():
     ctrl = FactorioController()
     obs_proc = ObservationProcessor(size=128, stack_size=4)
     reward_signal = RewardSignal(win_w, win_h)
+    apply_reward_multipliers(reward_signal)
 
     net = ActorCritic().to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=LR, eps=1e-5)
@@ -324,24 +436,49 @@ def main():
     step_interval = 1.0 / DECISIONS_PER_SEC
 
     print(f"\nConfig: {STEPS_PER_UPDATE} steps/update, {PPO_EPOCHS} epochs, "
-          f"lr={LR}, clip={CLIP_EPS}, {DECISIONS_PER_SEC} decisions/sec")
-    print(f"\nStarting in 3 seconds — switch to Factorio!")
-    for i in range(3, 0, -1):
-        print(f"  {i}...")
-        time.sleep(1)
+          f"lr={LR}, clip={CLIP_EPS}, frame_skip={FRAME_SKIP}, "
+          f"{DECISIONS_PER_SEC} decisions/sec")
 
-    print("\nTraining started. Press Ctrl+C to stop.\n")
+    # --- Curriculum: optionally start a fresh game ---
+    if "--fresh" in os.sys.argv:
+        print("\nStarting in 3 seconds — will create fresh game...")
+        for i in range(3, 0, -1):
+            print(f"  {i}...")
+            time.sleep(1)
+        start_fresh_game(ctrl)
+    else:
+        print(f"\nStarting in 3 seconds — switch to Factorio! (use --fresh for new game)")
+        for i in range(3, 0, -1):
+            print(f"  {i}...")
+            time.sleep(1)
 
+    # Start safety systems
+    _start_kill_switch()
+    print("\nTraining started. F12 = kill switch. Pauses when Factorio loses focus.\n")
+
+    paused = False
     episode_reward = 0.0
     episode_steps = 0
     episode_num = 0
     update_count = 0
     last_loss_info = {}
     action_counts = np.zeros(NUM_ACTIONS, dtype=np.int64)
+    reward_history = []  # Rolling window of per-update rewards
 
     try:
-        while True:
+        while not _kill_flag.is_set():
             step_start = time.time()
+
+            # 0. Focus guard — pause when Factorio isn't focused
+            if not _is_factorio_focused():
+                if not paused:
+                    print("  [PAUSED] Factorio lost focus — waiting...")
+                    paused = True
+                time.sleep(0.2)
+                continue
+            if paused:
+                print("  [RESUMED] Factorio focused")
+                paused = False
 
             # 1. Capture and preprocess
             img = sct.grab(monitor)
@@ -357,25 +494,30 @@ def main():
                 log_prob_val = log_prob.item()
                 value_val = value.item()
 
-            # 3. Execute action
-            execute_action(ctrl, action_id)
+            # 3. Execute action with frame skip — repeat for N frames
+            total_reward = 0.0
+            for _skip in range(FRAME_SKIP):
+                if _kill_flag.is_set():
+                    break
+                execute_action(ctrl, action_id)
+                # Capture after each repeated action
+                img2 = sct.grab(monitor)
+                skip_frame = np.array(img2)[:, :, :3]
+                r, _ = reward_signal.compute(skip_frame)
+                total_reward += r
             action_counts[action_id] += 1
 
-            # 4. Capture next frame, compute reward
-            img2 = sct.grab(monitor)
-            next_frame = np.array(img2)[:, :, :3]
-            reward, _ = reward_signal.compute(next_frame)
-
-            obs_proc.push(next_frame)
+            # 4. Use last frame from skip sequence as next observation
+            obs_proc.push(skip_frame)
             next_obs = obs_proc.get()
 
             done = False  # Factorio doesn't have episodes; continuous
 
-            # 5. Store experience
-            rollout.push(obs, action_id, log_prob_val, reward, value_val, done)
-            replay.push(obs, action_id, reward, next_obs, done)
+            # 5. Store experience (accumulated reward across skipped frames)
+            rollout.push(obs, action_id, log_prob_val, total_reward, value_val, done)
+            replay.push(obs, action_id, total_reward, next_obs, done)
 
-            episode_reward += reward
+            episode_reward += total_reward
             episode_steps += 1
             global_step += 1
 
@@ -386,6 +528,12 @@ def main():
                 last_loss_info = loss_info
                 rollout.clear()
 
+                # Track rolling reward
+                reward_history.append(episode_reward)
+                if len(reward_history) > 100:
+                    reward_history.pop(0)
+                rolling_avg = sum(reward_history) / len(reward_history)
+
                 # Log
                 replay_stats = replay.stats()
                 top_actions = np.argsort(action_counts)[::-1][:5]
@@ -393,6 +541,7 @@ def main():
 
                 print(f"[Step {global_step:>7d} | Update {update_count:>3d}] "
                       f"reward={episode_reward:+.3f}  "
+                      f"avg100={rolling_avg:+.3f}  "
                       f"p_loss={loss_info['policy_loss']:.4f}  "
                       f"v_loss={loss_info['value_loss']:.4f}  "
                       f"entropy={loss_info['entropy']:.3f}  "
@@ -416,6 +565,8 @@ def main():
                 time.sleep(sleep_time)
 
     except KeyboardInterrupt:
+        pass
+    finally:
         print(f"\n\nTraining stopped at step {global_step}.")
         save_checkpoint(
             net, optimizer, global_step, cumulative_reward + episode_reward,
@@ -432,7 +583,6 @@ def main():
             print(f"  Last p_loss:    {last_loss_info['policy_loss']:.4f}")
             print(f"  Last entropy:   {last_loss_info['entropy']:.3f}")
         print("\nDone.")
-    finally:
         sct.close()
 
 
