@@ -569,14 +569,6 @@ def main():
     replay = ReplayBuffer(capacity=10_000)
     rollout = RolloutBuffer()
 
-    # Init translator (needs replay/rollout refs)
-    if not baseline_mode:
-        translator = ActionTranslator(
-            ctrl=ctrl, obs_proc=obs_proc, reward_signal=reward_signal,
-            replay=replay, rollout=rollout, monitor=monitor,
-            strategy_vec=None, sct=sct,
-        )
-
     # Experiment-specific checkpoints
     exp_checkpoint_dir = CHECKPOINT_DIR / experiment_tag
     exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -595,6 +587,11 @@ def main():
     if not baseline_mode:
         advisor = Advisor(knowledge, sct, monitor, device)
         advisor.start()
+        translator = ActionTranslator(
+            ctrl=ctrl, obs_proc=obs_proc, reward_signal=reward_signal,
+            replay=replay, rollout=rollout, monitor=monitor,
+            strategy_vec=None, sct=sct,
+        )
 
     # --- Timing ---
     step_interval = 1.0 / DECISIONS_PER_SEC
