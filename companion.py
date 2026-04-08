@@ -63,6 +63,8 @@ SYSTEM_PROMPT = (
     '  {"type":"type_text", "text":"hello"}\n'
     '  {"type":"wait", "seconds":0.5}\n'
     "Coordinates are absolute screen pixels matching the screenshot dimensions.\n"
+    "When performing timed actions like mining for a duration, always use the hold_click "
+    "JSON format with explicit x, y, button, and duration fields. Do not use bbox_2d format.\n"
     "IMPORTANT: In Factorio, the player character is ALWAYS at the center of the screen "
     "(approximately 640, 360 on a 1280x720 display). To mine resources the character is "
     "standing on, right click hold at screen center coordinates (640, 360), NOT on UI panels.\n"
@@ -253,11 +255,40 @@ class Speaker:
 # Action executor
 # ---------------------------------------------------------------------------
 
+def _convert_bbox_action(obj: dict) -> dict | None:
+    """Convert a bbox_2d + label object into a standard action dict."""
+    import re
+    bbox = obj.get("bbox_2d")
+    label = obj.get("label", "").lower()
+    if not bbox or len(bbox) != 4:
+        return None
+
+    x = int((bbox[0] + bbox[2]) / 2)
+    y = int((bbox[1] + bbox[3]) / 2)
+
+    # Parse duration from label (e.g. "for 60 seconds")
+    dur_match = re.search(r"(\d+(?:\.\d+)?)\s*seconds?", label)
+    duration = float(dur_match.group(1)) if dur_match else 3.0
+
+    # Determine button from label
+    if "right" in label:
+        button = "right"
+    else:
+        button = "left"
+
+    if "hold" in label or "mining" in label or duration > 1.0:
+        return {"type": "hold_click", "x": x, "y": y,
+                "button": button, "duration": duration}
+    else:
+        return {"type": "click", "x": x, "y": y, "button": button}
+
+
 def parse_actions(response_text: str) -> list[dict]:
     """Extract action list from any fenced JSON code block in the response.
-    Handles ```actions, ```json, or bare ``` blocks containing a JSON array."""
+    Handles ```actions, ```json, or bare ``` blocks containing a JSON array.
+    Also handles bbox_2d format from vision-language models."""
     import re
-    # Match ```actions, ```json, or bare ``` blocks with a JSON array inside
+    # Match ```actions, ```json, or bare ``` blocks with a JSON array or object
     for pattern in [
         r"```(?:actions|json)?\s*\n(\[.*?\])\s*\n```",
         r"```(?:actions|json)?\s*\n(\{.*?\})\s*\n```",
@@ -267,19 +298,48 @@ def parse_actions(response_text: str) -> list[dict]:
             raw = match.group(1)
             try:
                 parsed = json.loads(raw)
-                # Wrap single object in a list
                 if isinstance(parsed, dict):
                     parsed = [parsed]
-                return parsed
+                # Convert any bbox_2d items to standard actions
+                results = []
+                for item in parsed:
+                    if "bbox_2d" in item:
+                        converted = _convert_bbox_action(item)
+                        if converted:
+                            results.append(converted)
+                    else:
+                        results.append(item)
+                return results
             except json.JSONDecodeError:
                 continue
+
+    # Fallback: detect inline bbox_2d JSON (no code fence)
+    bbox_pattern = r"\{[^}]*'bbox_2d'[^}]*\}|\{[^}]*\"bbox_2d\"[^}]*\}"
+    matches = re.findall(bbox_pattern, response_text)
+    if matches:
+        results = []
+        for m in matches:
+            # Normalize single quotes to double quotes for JSON parsing
+            normalized = m.replace("'", '"')
+            try:
+                obj = json.loads(normalized)
+                converted = _convert_bbox_action(obj)
+                if converted:
+                    results.append(converted)
+            except json.JSONDecodeError:
+                continue
+        if results:
+            return results
+
     return []
 
 
 def strip_actions_block(text: str) -> str:
-    """Remove any fenced code block (```...```) from spoken text."""
+    """Remove any fenced code block and inline bbox_2d JSON from spoken text."""
     import re
-    return re.sub(r"```(?:actions|json)?\s*\n.*?\n```", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"```(?:actions|json)?\s*\n.*?\n```", "", text, flags=re.DOTALL)
+    text = re.sub(r"\{[^}]*['\"]bbox_2d['\"][^}]*\}", "", text)
+    return text.strip()
 
 
 def execute_actions(actions: list[dict], scale: float = 1.0, interrupted=None):
