@@ -39,7 +39,7 @@ SILENCE_THRESHOLD = 0.003          # RMS below this = silence (Yeti at low gain)
 SILENCE_DURATION = 0.8             # seconds of silence to end utterance
 MAX_RECORD_SECONDS = 30            # safety cap per utterance
 MIC_GAIN = 15.0                    # software amplification for quiet mics
-SCREENSHOT_MAX_WIDTH = 1280        # resize before sending to vision model
+SCREENSHOT_MAX_WIDTH = 2560        # send full native resolution for UI text accuracy
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OLLAMA_URL = "http://localhost:11434"
@@ -65,9 +65,15 @@ SYSTEM_PROMPT = (
     "Coordinates are absolute screen pixels matching the screenshot dimensions.\n"
     "When performing timed actions like mining for a duration, always use the hold_click "
     "JSON format with explicit x, y, button, and duration fields. Do not use bbox_2d format.\n"
+    "When the user specifies a time duration like one minute or 30 seconds, always use that "
+    "exact duration in seconds in the action. One minute = 60, 30 seconds = 30. "
+    "Never substitute a shorter duration.\n"
     "IMPORTANT: In Factorio, the player character is ALWAYS at the center of the screen "
     "(approximately 640, 360 on a 1280x720 display). To mine resources the character is "
     "standing on, right click hold at screen center coordinates (640, 360), NOT on UI panels.\n"
+    "After executing any action, always take a new screenshot to observe the actual result. "
+    "Never predict or estimate outcomes — only report what you can actually see in the "
+    "screenshot after the action completes. If you cannot see the result clearly, say so.\n"
     "Only include the actions block when the user asks you to DO something. "
     "For pure conversation, just respond normally."
 )
@@ -222,10 +228,15 @@ class Speaker:
         t = threading.Thread(target=self._speak, args=(text,), daemon=True)
         t.start()
 
+    @staticmethod
+    def _sanitize(text: str) -> str:
+        """Strip emoji and non-ASCII characters that crash Windows TTS."""
+        return text.encode("ascii", "ignore").decode("ascii")
+
     def _speak(self, text: str):
         with self._lock:
             try:
-                for line in text.replace(". ", ".\n").split("\n"):
+                for line in self._sanitize(text).replace(". ", ".\n").split("\n"):
                     line = line.strip()
                     if line:
                         self._proc.stdin.write(line + "\n")
@@ -299,7 +310,11 @@ def parse_actions(response_text: str) -> list[dict]:
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, dict):
-                    parsed = [parsed]
+                    # Unwrap nested {"actions": [...]} format
+                    if "actions" in parsed and isinstance(parsed["actions"], list):
+                        parsed = parsed["actions"]
+                    else:
+                        parsed = [parsed]
                 # Convert any bbox_2d items to standard actions
                 results = []
                 for item in parsed:
