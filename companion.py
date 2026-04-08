@@ -63,6 +63,9 @@ SYSTEM_PROMPT = (
     '  {"type":"type_text", "text":"hello"}\n'
     '  {"type":"wait", "seconds":0.5}\n'
     "Coordinates are absolute screen pixels matching the screenshot dimensions.\n"
+    "IMPORTANT: In Factorio, the player character is ALWAYS at the center of the screen "
+    "(approximately 640, 360 on a 1280x720 display). To mine resources the character is "
+    "standing on, right click hold at screen center coordinates (640, 360), NOT on UI panels.\n"
     "Only include the actions block when the user asks you to DO something. "
     "For pure conversation, just respond normally."
 )
