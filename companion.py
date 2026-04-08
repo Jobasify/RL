@@ -39,7 +39,7 @@ SILENCE_THRESHOLD = 0.003          # RMS below this = silence (Yeti at low gain)
 SILENCE_DURATION = 0.8             # seconds of silence to end utterance
 MAX_RECORD_SECONDS = 30            # safety cap per utterance
 MIC_GAIN = 15.0                    # software amplification for quiet mics
-SCREENSHOT_MAX_WIDTH = 2560        # send full native resolution for UI text accuracy
+SCREENSHOT_MAX_WIDTH = 1280        # default, overridden by --resolution flag
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OLLAMA_URL = "http://localhost:11434"
@@ -699,11 +699,28 @@ def main():
                         help="Use local Ollama instead of Anthropic API")
     parser.add_argument("--model", type=str, default=None,
                         help="Ollama model name (default: llava). e.g. --model moondream")
+    parser.add_argument("--resolution", type=str, default="720",
+                        help="Screenshot resolution: 360, 720 (default), or native")
     args = parser.parse_args()
+
+    # Set screenshot resolution
+    global SCREENSHOT_MAX_WIDTH
+    RES_MAP = {"360": 640, "720": 1280, "native": 99999}
+    if args.resolution in RES_MAP:
+        SCREENSHOT_MAX_WIDTH = RES_MAP[args.resolution]
+    else:
+        try:
+            SCREENSHOT_MAX_WIDTH = int(args.resolution)
+        except ValueError:
+            print(f"  Invalid resolution: {args.resolution}. Use 360, 720, or native.")
+            sys.exit(1)
 
     print("=" * 50)
     print("  Companion — talk to me, I can see your screen")
     print("=" * 50)
+
+    res_label = f"{SCREENSHOT_MAX_WIDTH}px wide" if args.resolution != "native" else "native"
+    print(f"  Resolution: {res_label}")
 
     if args.local:
         model = args.model or OLLAMA_DEFAULT_MODEL
