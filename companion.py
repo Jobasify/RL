@@ -68,12 +68,18 @@ SYSTEM_PROMPT = (
     "When the user specifies a time duration like one minute or 30 seconds, always use that "
     "exact duration in seconds in the action. One minute = 60, 30 seconds = 30. "
     "Never substitute a shorter duration.\n"
-    "IMPORTANT: In Factorio, the player character is ALWAYS at the center of the screen "
-    "(approximately 640, 360 on a 1280x720 display). To mine resources the character is "
-    "standing on, right click hold at screen center coordinates (640, 360), NOT on UI panels.\n"
-    "After executing any action, always take a new screenshot to observe the actual result. "
-    "Never predict or estimate outcomes — only report what you can actually see in the "
-    "screenshot after the action completes. If you cannot see the result clearly, say so.\n"
+    "IMPORTANT: The player character is ALWAYS at the CENTER of the screenshot. "
+    "Center = half the image width and half the image height. For a 640x360 screenshot, "
+    "center is (320, 180). For 1280x720, center is (640, 360). "
+    "When mining resources the character is standing on, use the center coordinates. "
+    "Never use the full image dimensions as coordinates — that is the boundary, not a valid click.\n"
+    "For all mining and interaction actions when the character is standing on a resource, "
+    "always use exactly x=320, y=180 as the coordinates. This is always the screen center "
+    "where your character stands.\n"
+    "Always execute actions BEFORE reporting results. Never describe what happened before "
+    "it has happened. After executing any action, take a new screenshot to observe the "
+    "actual result. Never predict or estimate outcomes — only report what you can actually "
+    "see in the screenshot after the action completes. If you cannot see the result clearly, say so.\n"
     "Only include the actions block when the user asks you to DO something. "
     "For pure conversation, just respond normally."
 )
@@ -85,21 +91,20 @@ SYSTEM_PROMPT = (
 
 def grab_screenshot() -> tuple[str, int, int, float]:
     """Capture the primary monitor, return (base64_jpeg, width, height, scale).
-    scale = actual_screen_width / screenshot_width — multiply coordinates by this."""
+    scale = captured_width / sent_width — multiply model coordinates by this."""
     with mss.mss() as sct:
         monitor = sct.monitors[1]
         img = sct.grab(monitor)
-        actual_w = monitor["width"]
 
-    frame = Image.frombytes("RGB", (img.width, img.height), img.rgb)
+    captured_w, captured_h = img.width, img.height
+    frame = Image.frombytes("RGB", (captured_w, captured_h), img.rgb)
 
-    scale = 1.0
     if frame.width > SCREENSHOT_MAX_WIDTH:
-        scale = frame.width / SCREENSHOT_MAX_WIDTH
-        frame = frame.resize(
-            (SCREENSHOT_MAX_WIDTH, int(frame.height / scale)),
-            Image.LANCZOS,
-        )
+        scale = captured_w / SCREENSHOT_MAX_WIDTH
+        new_h = int(captured_h / scale)
+        frame = frame.resize((SCREENSHOT_MAX_WIDTH, new_h), Image.LANCZOS)
+    else:
+        scale = 1.0
 
     buf = io.BytesIO()
     frame.save(buf, format="JPEG", quality=75)
@@ -357,15 +362,35 @@ def strip_actions_block(text: str) -> str:
     return text.strip()
 
 
-def execute_actions(actions: list[dict], scale: float = 1.0, interrupted=None):
+def execute_actions(actions: list[dict], scale: float = 1.0, interrupted=None,
+                    img_w: int = 0, img_h: int = 0):
     """Execute a list of action dicts using pynput directly.
     scale: multiply coordinates by this to map screenshot coords to real screen.
-    interrupted: callable that returns True if we should abort."""
+    interrupted: callable that returns True if we should abort.
+    img_w, img_h: screenshot dimensions for boundary coordinate correction."""
     from pynput.mouse import Button, Controller as MouseController
     from pynput.keyboard import Key, Controller as KeyboardController
 
     mouse = MouseController()
     kb = KeyboardController()
+
+    def _fix_boundary_coords(action: dict):
+        """If coordinates are at or near the image boundary, replace with center."""
+        if img_w == 0 or img_h == 0:
+            return
+        for xk, yk, wref, href in [("x", "y", img_w, img_h),
+                                     ("x1", "y1", img_w, img_h),
+                                     ("x2", "y2", img_w, img_h)]:
+            if xk not in action or yk not in action:
+                continue
+            ax, ay = action[xk], action[yk]
+            # Exact boundary match only — (640,360) on a 640x360 image
+            if ax == wref and ay == href:
+                cx, cy = wref // 2, href // 2
+                print(f"  [COORDINATE CORRECTED] boundary coords ({ax},{ay}) "
+                      f"replaced with screen center ({cx},{cy})")
+                action[xk] = cx
+                action[yk] = cy
 
     def sx(v):
         return int(v * scale)
@@ -396,11 +421,14 @@ def execute_actions(actions: list[dict], scale: float = 1.0, interrupted=None):
         if interrupted and interrupted():
             print("  [interrupted]")
             break
+        _fix_boundary_coords(action)
         t = action.get("type", "")
+        raw_x, raw_y = action.get("x", 0), action.get("y", 0)
         try:
             if t == "click":
                 bname = action.get("button", "left")
                 ax, ay = sx(action["x"]), sy(action["y"])
+                print(f"  [SCALE] model=({raw_x},{raw_y}) x{scale:.1f} -> screen=({ax},{ay})")
                 mouse.position = (ax, ay)
                 time.sleep(0.05)
                 btn = Button.right if bname == "right" else Button.left
@@ -409,6 +437,7 @@ def execute_actions(actions: list[dict], scale: float = 1.0, interrupted=None):
             elif t == "hold_click":
                 bname = action.get("button", "left")
                 ax, ay = sx(action["x"]), sy(action["y"])
+                print(f"  [SCALE] model=({raw_x},{raw_y}) x{scale:.1f} -> screen=({ax},{ay})")
                 dur = action.get("duration", 3.0)
                 mouse.position = (ax, ay)
                 time.sleep(0.05)
@@ -814,7 +843,8 @@ def main():
                 if actions:
                     print(f"  Executing {len(actions)} action(s) (scale {scale:.1f}x)...")
                     execute_actions(actions, scale,
-                                    interrupted=lambda: not speech_queue.empty())
+                                    interrupted=lambda: not speech_queue.empty(),
+                                    img_w=sw, img_h=sh)
                     if not speech_queue.empty():
                         print("  [interrupted by user]")
                         break
